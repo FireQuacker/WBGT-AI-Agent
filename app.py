@@ -63,8 +63,10 @@ def get_osha_tz_value(lon: float) -> str:
     else: return "-10"
 
 def geocode_address_native(address: str) -> dict:
-    url = "[https://nominatim.openstreetmap.org/search](https://nominatim.openstreetmap.org/search)"
-    query_params = {"q": address, "format": "json", "limit": 1}
+    url = "https://nominatim.openstreetmap.org/search"
+    # Ensure all whitespace or control characters are stripped completely
+    clean_address = address.strip() if address else ""
+    query_params = {"q": clean_address, "format": "json", "limit": 1}
     headers = {"User-Agent": "OSHA-WBGT-Web-Dashboard/2.0"}
     try:
         response = requests.get(url, params=query_params, headers=headers)
@@ -75,7 +77,7 @@ def geocode_address_native(address: str) -> dict:
         return {"error": str(e)}
 
 def fetch_weather_native(lat: float, lon: float, date_str: str) -> dict:
-    url = "[https://archive-api.open-meteo.com/v1/archive](https://archive-api.open-meteo.com/v1/archive)"
+    url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
         "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
@@ -116,7 +118,7 @@ def run_browser_automation(hourly_data, weight):
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.dismiss())
         
-        target_url = "[https://www.osha.gov/heat-exposure/wbgt-calculator](https://www.osha.gov/heat-exposure/wbgt-calculator)"
+        target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
         status_text.text("Connecting to secure OSHA computation host...")
         
         try:
@@ -299,10 +301,8 @@ if st.session_state.step == 1:
         else:
             with st.spinner("Synthesizing context parameters via Gemini Core Engine..."):
                 try:
-                    # Initialize client cleanly using structured parameters
                     client = genai.Client(api_key=active_key.strip())
                     
-                    # Native object generation configuration avoids raw string parser faults
                     response = client.models.generate_content(
                         model="gemini-2.5-flash",
                         contents=user_prompt.strip(),
@@ -313,9 +313,9 @@ if st.session_state.step == 1:
                         )
                     )
                     
-                    # Direct generation mapping converts structured returns directly into variables
                     intent = response.parsed
                     
+                    # Passing stripped fields cleanly to avoid transport issues
                     geo = geocode_address_native(intent.address)
                     if "error" in geo:
                         st.error(geo["error"])
