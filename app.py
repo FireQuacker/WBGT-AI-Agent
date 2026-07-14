@@ -63,7 +63,7 @@ def get_osha_tz_value(lon: float) -> str:
     else: return "-10"
 
 def geocode_address_native(address: str) -> dict:
-    url = "[https://nominatim.openstreetmap.org/search](https://nominatim.openstreetmap.org/search)"
+    url = "https://nominatim.openstreetmap.org/search"
     query_params = {"q": address, "format": "json", "limit": 1}
     headers = {"User-Agent": "OSHA-WBGT-Web-Dashboard/2.0"}
     try:
@@ -75,7 +75,7 @@ def geocode_address_native(address: str) -> dict:
         return {"error": str(e)}
 
 def fetch_weather_native(lat: float, lon: float, date_str: str) -> dict:
-    url = "[https://archive-api.open-meteo.com/v1/archive](https://archive-api.open-meteo.com/v1/archive)"
+    url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
         "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
@@ -116,7 +116,7 @@ def run_browser_automation(hourly_data, weight):
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.dismiss())
         
-        target_url = "[https://www.osha.gov/heat-exposure/wbgt-calculator](https://www.osha.gov/heat-exposure/wbgt-calculator)"
+        target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
         status_text.text("Connecting to secure OSHA computation host...")
         
         try:
@@ -271,11 +271,10 @@ st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
 st.markdown("Automated localized microclimate timeline extraction and regulatory threshold screening dashboard.")
 st.divider()
 
+# Bind the input value safely into session state so it persists across runs
 api_key_env = os.environ.get("GEMINI_API_KEY", "")
 if not api_key_env:
-    api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
-    if api_key_input:
-        os.environ["GEMINI_API_KEY"] = api_key_input
+    st.sidebar.text_input("Enter Gemini API Key", type="password", key="secure_gemini_key")
 
 # --- WIZARD STEP 1: PARSE USER INTENT & HISTORICAL WEATHER MATRIX ---
 if st.session_state.step == 1:
@@ -292,14 +291,18 @@ if st.session_state.step == 1:
         worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
     if st.button("Analyze Shift Timeline", type="primary"):
-        if not os.environ.get("GEMINI_API_KEY"):
+        # Resolve active key cleanly across variables and state frames
+        active_key = os.environ.get("GEMINI_API_KEY") or st.session_state.get("secure_gemini_key", "")
+        
+        if not active_key.strip():
             st.error("Please supply a valid Gemini API Token to authorize query synthesis.")
         elif not user_prompt.strip():
             st.warning("Please type an engineering assessment request string.")
         else:
             with st.spinner("Synthesizing context parameters via Gemini Core Engine..."):
                 try:
-                    client = genai.Client()
+                    # Pass key explicitly to bypass hot-reload environment drops
+                    client = genai.Client(api_key=active_key.strip())
                     response = client.models.generate_content(
                         model="gemini-2.5-flash",
                         contents=user_prompt.strip(),
