@@ -1,0 +1,13 @@
+libgbm1
+libnss3
+libatk-bridge2.0-0
+libx11-xcb1
+libxcb-dri3-0
+libxcomposite1
+libxcursor1
+libxdamage1
+libxfixes3
+libxi6
+libxrandr2
+libxtst6
+libasound2
