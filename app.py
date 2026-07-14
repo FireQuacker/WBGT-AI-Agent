@@ -98,21 +98,58 @@ def run_browser_automation(hourly_data, weight):
     status_text = st.empty()
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        context = browser.new_context()
+        # Launch browser with standard anti-detection and cloud-sharing memory bypass flags
+        browser = p.chromium.launch(
+            headless=True, 
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        )
+        
+        # Explicit user-agent protects against cloud scraper blocking from gov firewalls
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.dismiss())
         
         target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
-        page.goto(target_url)
+        status_text.text("Connecting to secure OSHA computation host...")
         
-        target_frame = page
-        for frame in page.frames:
-            try:
-                frame.locator('input[name="temp"]').wait_for(state="attached", timeout=2000)
-                target_frame = frame
-                break
-            except: continue
+        try:
+            page.goto(target_url, wait_until="networkidle", timeout=30000)
+            
+            target_frame = None
+            # Scan parent context and frames to robustly catch the widget
+            for _ in range(10):
+                for frame in page.frames:
+                    try:
+                        if frame.locator('input[name="temp"]').count() > 0:
+                            target_frame = frame
+                            break
+                    except Exception:
+                        continue
+                if target_frame:
+                    break
+                time.sleep(1)
+                
+            if not target_frame:
+                if page.locator('input[name="temp"]').count() > 0:
+                    target_frame = page
+                else:
+                    st.error("🚨 Connection Block: The calculator frame was unreachable. OSHA network could be overloaded.")
+                    browser.close()
+                    return []
+                    
+        except Exception as e:
+            st.error(f"🚨 Page load exception. The cloud host may be experiencing routing anomalies: {e}")
+            browser.close()
+            return []
                 
         total_rows = len(hourly_data)
         for index, hour in enumerate(hourly_data):
@@ -132,17 +169,17 @@ def run_browser_automation(hourly_data, weight):
                 target_frame.locator('input[name="ws"]').fill(str(hour['wind_speed_mph']))
                 target_frame.locator('input[name="pres"]').fill(str(hour['barometric_pressure_inhg']))
                 
-                try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
-                except: pass
-                try: target_frame.locator('select[name="tz"]').select_option(label=target_label, timeout=100)
-                except: pass
+                try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=250)
+                except Exception: pass
+                try: target_frame.locator('select[name="tz"]').select_option(label=target_label, timeout=250)
+                except Exception: pass
                 
-                time.sleep(0.05)
+                time.sleep(0.1)
                 target_frame.locator('input[value="Submit"]').click()
                 
                 sun_wbgt, shade_wbgt = "---", "---"
-                for _ in range(40):  
-                    time.sleep(0.05)
+                for _ in range(80):  
+                    time.sleep(0.1)
                     live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
                     if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
                         sun_wbgt = live_sun_val.strip()
@@ -283,7 +320,7 @@ if st.session_state.step == 1:
                             times, temps, hums, winds, press = hourly["time"], hourly["temperature_2m"], hourly["relative_humidity_2m"], hourly["wind_speed_10m"], hourly["surface_pressure"]
                             
                             try: final_date_str = datetime.strptime(intent.date, "%Y-%m-%d").strftime("%m/%d/%Y")
-                            except: final_date_str = intent.date
+                            except Exception: final_date_str = intent.date
                             
                             tz_val = get_osha_tz_value(geo["longitude"])
                             active_rows = []
