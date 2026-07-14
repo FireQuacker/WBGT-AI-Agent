@@ -63,7 +63,7 @@ def get_osha_tz_value(lon: float) -> str:
     else: return "-10"
 
 def geocode_address_native(address: str) -> dict:
-    url = "https://nominatim.openstreetmap.org/search"
+    url = "[https://nominatim.openstreetmap.org/search](https://nominatim.openstreetmap.org/search)"
     query_params = {"q": address, "format": "json", "limit": 1}
     headers = {"User-Agent": "OSHA-WBGT-Web-Dashboard/2.0"}
     try:
@@ -75,7 +75,7 @@ def geocode_address_native(address: str) -> dict:
         return {"error": str(e)}
 
 def fetch_weather_native(lat: float, lon: float, date_str: str) -> dict:
-    url = "https://archive-api.open-meteo.com/v1/archive"
+    url = "[https://archive-api.open-meteo.com/v1/archive](https://archive-api.open-meteo.com/v1/archive)"
     params = {
         "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
         "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
@@ -98,7 +98,6 @@ def run_browser_automation(hourly_data, weight):
     status_text = st.empty()
     
     with sync_playwright() as p:
-        # Launch browser with standard anti-detection and cloud-sharing memory bypass flags
         browser = p.chromium.launch(
             headless=True, 
             args=[
@@ -109,7 +108,6 @@ def run_browser_automation(hourly_data, weight):
             ]
         )
         
-        # Explicit user-agent protects against cloud scraper blocking from gov firewalls
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800}
@@ -118,14 +116,13 @@ def run_browser_automation(hourly_data, weight):
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.dismiss())
         
-        target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
+        target_url = "[https://www.osha.gov/heat-exposure/wbgt-calculator](https://www.osha.gov/heat-exposure/wbgt-calculator)"
         status_text.text("Connecting to secure OSHA computation host...")
         
         try:
             page.goto(target_url, wait_until="networkidle", timeout=30000)
             
             target_frame = None
-            # Scan parent context and frames using the explicit IDs found in your extension
             for _ in range(10):
                 for frame in page.frames:
                     try:
@@ -160,7 +157,6 @@ def run_browser_automation(hourly_data, weight):
                 formatted_time = f"{hour['hour_24h']:02d}:00"
                 target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
                 
-                # Form filling using exact element IDs from your browser extension script
                 target_frame.locator('#dd').fill(str(hour["date_string_final"]))
                 target_frame.locator('#tm').fill(formatted_time)
                 target_frame.locator('#lat').fill(str(hour["latitude"]))
@@ -176,7 +172,6 @@ def run_browser_automation(hourly_data, weight):
                 except Exception: pass
                 
                 time.sleep(0.1)
-                # Click submission using the exact ID 'sub' from the extension
                 target_frame.locator('#sub').click()
                 
                 sun_wbgt, shade_wbgt = "---", "---"
@@ -314,7 +309,19 @@ if st.session_state.step == 1:
                             response_schema=UserIntent
                         )
                     )
-                    intent = UserIntent.model_validate_json(response.text)
+                    
+                    # Robust Markdown Code Fence Sanitizer to handle erratic LLM formats
+                    raw_text = response.text.strip() if response.text else ""
+                    if raw_text.startswith("```"):
+                        if raw_text.startswith("```json"):
+                            raw_text = raw_text[7:]
+                        else:
+                            raw_text = raw_text[3:]
+                        if raw_text.endswith("```"):
+                            raw_text = raw_text[:-3]
+                        raw_text = raw_text.strip()
+                        
+                    intent = UserIntent.model_validate_json(raw_text)
                     
                     geo = geocode_address_native(intent.address)
                     if "error" in geo:
