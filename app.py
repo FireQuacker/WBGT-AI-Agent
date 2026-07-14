@@ -125,11 +125,11 @@ def run_browser_automation(hourly_data, weight):
             page.goto(target_url, wait_until="networkidle", timeout=30000)
             
             target_frame = None
-            # Scan parent context and frames to robustly catch the widget
+            # Scan parent context and frames using the explicit IDs found in your extension
             for _ in range(10):
                 for frame in page.frames:
                     try:
-                        if frame.locator('input[name="temp"]').count() > 0:
+                        if frame.locator('#temp').count() > 0:
                             target_frame = frame
                             break
                     except Exception:
@@ -139,7 +139,7 @@ def run_browser_automation(hourly_data, weight):
                 time.sleep(1)
                 
             if not target_frame:
-                if page.locator('input[name="temp"]').count() > 0:
+                if page.locator('#temp').count() > 0:
                     target_frame = page
                 else:
                     st.error("🚨 Connection Block: The calculator frame was unreachable. OSHA network could be overloaded.")
@@ -160,30 +160,38 @@ def run_browser_automation(hourly_data, weight):
                 formatted_time = f"{hour['hour_24h']:02d}:00"
                 target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
                 
-                target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
-                target_frame.locator('input[name="tm"]').fill(formatted_time)
-                target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
-                target_frame.locator('input[name="lon"]').fill(str(hour["longitude_absolute"]))
-                target_frame.locator('input[name="temp"]').fill(str(hour['temperature_f']))
-                target_frame.locator('input[name="rh"]').fill(str(hour['relative_humidity_percent']))
-                target_frame.locator('input[name="ws"]').fill(str(hour['wind_speed_mph']))
-                target_frame.locator('input[name="pres"]').fill(str(hour['barometric_pressure_inhg']))
+                # Form filling using exact element IDs from your browser extension script
+                target_frame.locator('#dd').fill(str(hour["date_string_final"]))
+                target_frame.locator('#tm').fill(formatted_time)
+                target_frame.locator('#lat').fill(str(hour["latitude"]))
+                target_frame.locator('#lon').fill(str(hour["longitude_absolute"]))
+                target_frame.locator('#temp').fill(str(hour['temperature_f']))
+                target_frame.locator('#rh').fill(str(hour['relative_humidity_percent']))
+                target_frame.locator('#ws').fill(str(hour['wind_speed_mph']))
+                target_frame.locator('#pres').fill(str(hour['barometric_pressure_inhg']))
                 
-                try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=250)
+                try: target_frame.locator('#tz').select_option(value=hour["tz_value"], timeout=250)
                 except Exception: pass
-                try: target_frame.locator('select[name="tz"]').select_option(label=target_label, timeout=250)
+                try: target_frame.locator('#tz').select_option(label=target_label, timeout=250)
                 except Exception: pass
                 
                 time.sleep(0.1)
-                target_frame.locator('input[value="Submit"]').click()
+                # Click submission using the exact ID 'sub' from the extension
+                target_frame.locator('#sub').click()
                 
                 sun_wbgt, shade_wbgt = "---", "---"
                 for _ in range(80):  
                     time.sleep(0.1)
                     live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
+                    if not live_sun_val or live_sun_val == "---":
+                        live_sun_val = target_frame.locator('#wbgt_sun').input_value()
+                        
                     if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
                         sun_wbgt = live_sun_val.strip()
-                        shade_wbgt = target_frame.locator('input[name="wbgt_shade"]').input_value().strip()
+                        try:
+                            shade_wbgt = target_frame.locator('input[name="wbgt_shade"]').input_value().strip()
+                        except Exception:
+                            shade_wbgt = target_frame.locator('#wbgt_shade').input_value().strip()
                         break
                 
                 sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip()) if "/" in sun_wbgt else 0.0
