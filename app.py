@@ -229,7 +229,7 @@ def generate_compliance_plot(results, weight):
 # =====================================================================
 st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
 st.markdown("Automated localized microclimate timeline extraction and regulatory threshold screening dashboard.")
-st.hr()
+st.divider()
 
 api_key_env = os.environ.get("GEMINI_API_KEY", "")
 if not api_key_env:
@@ -332,7 +332,7 @@ elif st.session_state.step == 2:
                 key=f"sel_{row['hour_24h']}"
             )
             
-    st.hr()
+    st.divider()
     c1, c2 = st.columns(2)
     with c1:
         if st.button("← Modify Location or Prompt Parameters"):
@@ -377,7 +377,7 @@ elif st.session_state.step == 3:
         mime="text/csv"
     )
     
-    st.hr()
+    st.divider()
     if st.button("🔄 Execute Fresh Inspection Run"):
         st.session_state.step = 1
         st.session_state.final_hourly_rows = None
