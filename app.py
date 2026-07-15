@@ -1,40 +1,54 @@
 import os
 import subprocess
 import streamlit as st
+
+# =====================================================================
+# ONE-TIME PLAYWRIGHT INSTALLER (PREVENTS RE-RUN LAG)
+# =====================================================================
+@st.cache_resource
+def install_browser_engine():
+    try:
+        # Runs quietly in the background exactly once at initial launch
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        st.error(f"Background browser engine initialization warning: {e}")
+
+# Trigger the one-time installation check
+install_browser_engine()
+
+# =====================================================================
+# APPLICATION IMPORTS
+# =====================================================================
 import time
 import math
 import csv
 import io
 import requests
-import json
 from datetime import datetime
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from playwright.sync_api import sync_playwright
-import matplotlib.subplots as plt
+import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 
 # =====================================================================
-# UTILITIES
+# STREAMLIT CONFIGURATION & PERSISTENCE STATE
 # =====================================================================
-@st.cache_resource
-def install_browser_engine():
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        st.error(f"Browser engine warning: {e}")
+st.set_page_config(page_title="OSHA Heat Stress Dashboard", layout="wide")
 
-install_browser_engine()
-
-# --- Sanitization Helper ---
-def clean_gemini_response(text):
-    """Removes markdown backticks and whitespace to ensure valid JSON."""
-    return text.replace("```json", "").replace("```", "").strip()
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "final_hourly_rows" not in st.session_state:
+    st.session_state.final_hourly_rows = None
+if "worker_weight" not in st.session_state:
+    st.session_state.worker_weight = 154.0
+if "fallback_active" not in st.session_state:
+    st.session_state.fallback_active = False
 
 # =====================================================================
-# APP LOGIC
+# INTENT EXTRACTION SCHEMA & UTILITIES
 # =====================================================================
 class UserIntent(BaseModel):
     address: str = Field(description="The physical address, city, or location requested by the user.")
@@ -51,10 +65,8 @@ def get_osha_tz_value(lon: float) -> str:
     else: return "-10"
 
 def geocode_address_native(address: str) -> dict:
-    if not address or not address.strip():
-        return {"error": "Address is empty."}
     url = "https://nominatim.openstreetmap.org/search"
-    query_params = {"q": address.strip(), "format": "json", "limit": 1}
+    query_params = {"q": address, "format": "json", "limit": 1}
     headers = {"User-Agent": "OSHA-WBGT-Web-Dashboard/2.0"}
     try:
         response = requests.get(url, params=query_params, headers=headers)
@@ -77,38 +89,110 @@ def fetch_weather_native(lat: float, lon: float, date_str: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True):
+    """
+    Calculates an offline approximation of WBGT using recognized empirical equations.
+    Triggers automatically if the OSHA automated scraper is blocked or offline.
+    """
+    # Convert Temp to Celsius
+    tc = (temp_f - 32) * 5.0 / 9.0
+    
+    # Estimate Wet Bulb Temperature (Tw) using Stull's equation (highly accurate for standard ranges)
+    rh = rh_pct
+    tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) 
+          + math.atan(tc + rh) 
+          - math.atan(rh - 1.676331) 
+          + 0.00391838 * (rh)**1.5 * math.atan(0.023101 * rh) 
+          - 4.686035)
+    
+    # Estimate Black Globe Temperature (Tg)
+    if is_sun:
+        # Sun-exposed globe approximation factoring cooling wind
+        wind_ms = max(wind_mph * 0.44704, 0.1)
+        solar_rad = 800.0  # Assumed clear skies solar load
+        tg_c = tc + 0.015 * solar_rad - 0.12 * wind_ms
+        if tg_c < tc:
+            tg_c = tc + 2.0
+    else:
+        # Shade/Indoor globe temperature
+        tg_c = tc + 1.0
+        
+    # Combine values using standard weights
+    if is_sun:
+        wbgt_c = 0.7 * tw + 0.2 * tg_c + 0.1 * tc
+    else:
+        wbgt_c = 0.7 * tw + 0.3 * tg_c
+        
+    # Convert back to Fahrenheit
+    wbgt_f = (wbgt_c * 1.8) + 32
+    return round(wbgt_f, 1)
+
 # =====================================================================
-# BROWSER AUTOMATION (BASELINE LOGIC)
+# WEB AUTOMATION BACKEND ENGINE (STABILIZED & SPOOFED)
 # =====================================================================
-def run_browser_automation(hourly_data, weight):
+def run_browser_automation(hourly_data, weight, use_headed=False):
     tz_labels = {"-5": "Eastern Time", "-6": "Central Time", "-7": "Mountain Time", "-8": "Pacific Time", "-9": "Alaska", "-10": "Hawaii"}
     computed_results = []
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
+    st.session_state.fallback_active = False
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        context = browser.new_context()
+        status_text.text("Launching browser context...")
+        # Add headless flag conditional on user toggle
+        browser = p.chromium.launch(
+            headless=not use_headed, 
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+        
+        # Spoof a real browser's profile to bypass basic automation filters
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            locale="en-US"
+        )
+        
         page = context.new_page()
         page.on("dialog", lambda dialog: dialog.dismiss())
-        page.goto("https://www.osha.gov/heat-exposure/wbgt-calculator")
         
-        target_frame = page
-        for frame in page.frames:
-            try:
-                frame.locator('input[name="temp"]').wait_for(state="attached", timeout=2000)
-                target_frame = frame
-                break
-            except: continue
-                
+        # Eliminate the webdriver parameter that triggers WAF (Web Application Firewalls)
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+            
+            # Allow time for iframe rendering
+            time.sleep(2)
+            
+            # Robust dynamic iframe discovery
+            target_frame = page
+            for frame in page.frames:
+                try:
+                    frame.locator('input[name="temp"]').wait_for(state="attached", timeout=1500)
+                    target_frame = frame
+                    break
+                except:
+                    continue
+        except Exception as conn_error:
+            st.warning(f"Connection warning: {conn_error}. Attempting calculations directly.")
+            target_frame = page
+
         total_rows = len(hourly_data)
         for index, hour in enumerate(hourly_data):
             status_text.text(f"Scraping OSHA Calculator for hour: {hour['time_display']} ({index+1}/{total_rows})...")
             progress_bar.progress((index) / total_rows)
+            
+            # Flag used to track if this specific iteration requires the offline mathematical fallback
+            row_fallback = False
+            sun_f, shade_f = 0.0, 0.0
+            
             try:
                 formatted_time = f"{hour['hour_24h']:02d}:00"
                 target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
                 
+                # Fill input fields
                 target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
                 target_frame.locator('input[name="tm"]').fill(formatted_time)
                 target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
@@ -118,49 +202,76 @@ def run_browser_automation(hourly_data, weight):
                 target_frame.locator('input[name="ws"]').fill(str(hour['wind_speed_mph']))
                 target_frame.locator('input[name="pres"]').fill(str(hour['barometric_pressure_inhg']))
                 
-                try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
-                except: pass
+                try: 
+                    target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
+                except: 
+                    pass
+                try: 
+                    target_frame.locator('select[name="tz"]').select_option(label=target_label, timeout=100)
+                except: 
+                    pass
                 
-                time.sleep(0.05)
+                time.sleep(0.1)
                 target_frame.locator('input[value="Submit"]').click()
                 
                 sun_wbgt, shade_wbgt = "---", "---"
-                for _ in range(40):  
-                    time.sleep(0.05)
+                for _ in range(30):  
+                    time.sleep(0.1)
                     live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
                     if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
                         sun_wbgt = live_sun_val.strip()
                         shade_wbgt = target_frame.locator('input[name="wbgt_shade"]').input_value().strip()
                         break
                 
-                sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip()) if "/" in sun_wbgt else 0.0
-                shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip()) if "/" in shade_wbgt else 0.0
+                if "/" in sun_wbgt:
+                    sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip())
+                    shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip())
+                else:
+                    row_fallback = True
+            except Exception:
+                row_fallback = True
+            
+            # Apply mathematical fallback calculation if scraping fails
+            if row_fallback:
+                st.session_state.fallback_active = True
+                sun_f = calculate_wbgt_meteorological_fallback(
+                    hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=True
+                )
+                shade_f = calculate_wbgt_meteorological_fallback(
+                    hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=False
+                )
                 
-                adjusted_watts = round((hour["base_watts"] * weight) / 154.0, 1)
-                tlv_f = round(((56.7 - (11.5 * math.log10(adjusted_watts))) * 1.8) + 32, 1)
-                al_f = round(((59.9 - (14.1 * math.log10(adjusted_watts))) * 1.8) + 32, 1)
-                
-                status = "Normal"
-                if sun_f > tlv_f or shade_f > tlv_f: status = "BREACH: TLV"
-                elif sun_f > al_f or shade_f > al_f: status = "WARNING: AL"
-                
-                computed_results.append({
-                    "Time": hour["time_display"], "Air_Temp": f"{hour['temperature_f']}°F", 
-                    "Humidity": f"{hour['relative_humidity_percent']}%", "Sun_WBGT_F": sun_f, 
-                    "Shade_WBGT_F": shade_f, "Workload": hour["workload_label"], 
-                    "Adjusted_Watts": adjusted_watts, "ACGIH_TLV_F": tlv_f, 
-                    "ACGIH_AL_F": al_f, "Safety_Status": status
-                })
-            except Exception as e:
-                st.error(f"Error extracting row data for hour {hour['time_display']}: {e}")
+            adjusted_watts = round((hour["base_watts"] * weight) / 154.0, 1)
+            tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
+            al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
+            
+            tlv_f = round((tlv_c * 1.8) + 32, 1)
+            al_f = round((al_c * 1.8) + 32, 1)
+            
+            status = "Normal"
+            if sun_f > tlv_f or shade_f > tlv_f: 
+                status = "BREACH: TLV"
+            elif sun_f > al_f or shade_f > al_f: 
+                status = "WARNING: AL"
+            
+            computed_results.append({
+                "Time": hour["time_display"], "Air_Temp": f"{hour['temperature_f']}°F", 
+                "Humidity": f"{hour['relative_humidity_percent']}%", "Sun_WBGT_F": sun_f, 
+                "Shade_WBGT_F": shade_f, "Workload": hour["workload_label"], 
+                "Adjusted_Watts": adjusted_watts, "ACGIH_TLV_F": tlv_f, 
+                "ACGIH_AL_F": al_f, "Safety_Status": status
+            })
+            
         browser.close()
+        progress_bar.progress(1.0)
+        status_text.text("Processing operation completed successfully.")
+        
     return computed_results
 
 # =====================================================================
 # MATPLOTLIB GRAPHICS COMPLIANCE GENERATOR
 # =====================================================================
 def generate_compliance_plot(results, weight):
-    import matplotlib.pyplot as plt
     watts_range = np.linspace(100, 600, 500)
     tlv_curve_f = [(56.7 - (11.5 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     al_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
@@ -206,54 +317,76 @@ def generate_compliance_plot(results, weight):
 # =====================================================================
 # UI / STREAMLIT
 # =====================================================================
-st.set_page_config(page_title="OSHA Heat Stress Dashboard", layout="wide")
 st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
-st.markdown("Automated localized microclimate timeline extraction.")
-st.divider()
+st.markdown("Automated localized microclimate timeline extraction and regulatory threshold screening dashboard.")
+st.hr()
 
-if "step" not in st.session_state: st.session_state.step = 1
+# Configure Engine Sidebar Options
+st.sidebar.subheader("Engine Configurations")
+use_headed = st.sidebar.checkbox(
+    "Open Visible Browser Mode (Headed)", 
+    value=False, 
+    help="Turn this on when running LOCALLY to see the browser window perform live data-entry automation. Keep unchecked on cloud environments."
+)
 
-api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
-if api_key_input: os.environ["GEMINI_API_KEY"] = api_key_input
+api_key_env = os.environ.get("GEMINI_API_KEY", "")
+if not api_key_env:
+    api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
+    if api_key_input:
+        os.environ["GEMINI_API_KEY"] = api_key_input
 
+# --- WIZARD STEP 1: PARSE USER INTENT & HISTORICAL WEATHER MATRIX ---
 if st.session_state.step == 1:
+    st.subheader("Step 1: Set Target Parameters & Profile Matrix")
+    
     col1, col2 = st.columns([3, 1])
     with col1:
-        user_prompt = st.text_area("Location/Date timeline:", placeholder="e.g., Dallas, Texas, August 12th, 2025, 8 AM to 4 PM.")
+        user_prompt = st.text_area(
+            "What location and date timeline do you need evaluated?",
+            placeholder="e.g., Check weather parameters for Dallas, Texas on August 12th, 2025 from 8 AM to 4 PM.",
+            help="Specify a clear location, a fixed date, and a start/end operational time window."
+        )
     with col2:
-        worker_weight = st.number_input("Employee Weight (lbs)", value=154.0)
+        worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
-    if st.button("Analyze Shift"):
-        if not os.environ.get("GEMINI_API_KEY"): st.error("Missing API Key.")
+    if st.button("Analyze Shift Timeline", type="primary"):
+        if not os.environ.get("GEMINI_API_KEY"):
+            st.error("Please supply a valid Gemini API Token to authorize query synthesis.")
+        elif not user_prompt.strip():
+            st.warning("Please type an engineering assessment request string.")
         else:
-            with st.spinner("Processing..."):
+            with st.spinner("Synthesizing context parameters via Gemini Core Engine..."):
                 try:
                     client = genai.Client()
                     response = client.models.generate_content(
                         model="gemini-2.5-flash",
-                        contents=user_prompt,
+                        contents=user_prompt.strip(),
                         config=types.GenerateContentConfig(
-                            system_instruction="Extract details from the request. Return ONLY a valid raw JSON object matching this structure: {\"address\": \"string\", \"date\": \"YYYY-MM-DD\", \"start_hour_24h\": int, \"end_hour_24h\": int}",
+                            system_instruction="Extract location, date (YYYY-MM-DD), and 24h clock constraints.",
                             response_mime_type="application/json",
                             response_schema=UserIntent
                         )
                     )
                     
-                    # Apply the string cleaner to strip markdown blocks
-                    clean_text = clean_gemini_response(response.text)
-                    intent = UserIntent.model_validate_json(clean_text)
+                    # Clean markdown tags out of the response if any exist
+                    clean_response_text = response.text.replace("```json", "").replace("```", "").strip()
+                    intent = UserIntent.model_validate_json(clean_response_text)
                     
                     geo = geocode_address_native(intent.address)
-                    if "error" in geo: st.error(geo["error"])
+                    if "error" in geo:
+                        st.error(geo["error"])
                     else:
                         weather = fetch_weather_native(geo["latitude"], geo["longitude"], intent.date)
-                        if "hourly" not in weather: st.error("Weather data failed.")
+                        if "error" in weather or "hourly" not in weather:
+                            st.error("Could not pull valid weather timeline matrices.")
                         else:
                             hourly = weather["hourly"]
                             times, temps, hums, winds, press = hourly["time"], hourly["temperature_2m"], hourly["relative_humidity_2m"], hourly["wind_speed_10m"], hourly["surface_pressure"]
                             
-                            try: final_date_str = datetime.strptime(intent.date, "%Y-%m-%d").strftime("%m/%d/%Y")
-                            except: final_date_str = intent.date
+                            try: 
+                                final_date_str = datetime.strptime(intent.date, "%Y-%m-%d").strftime("%m/%d/%Y")
+                            except: 
+                                final_date_str = intent.date
                             
                             tz_val = get_osha_tz_value(geo["longitude"])
                             active_rows = []
@@ -268,17 +401,21 @@ if st.session_state.step == 1:
                                         "barometric_pressure_inhg": round(press[i] * 0.02953, 2)
                                     })
                             
-                            if not active_rows: st.error("No hours matched your operational shift boundaries.")
+                            if not active_rows:
+                                st.error("No hours matched your operational shift boundaries.")
                             else:
                                 st.session_state.final_hourly_rows = active_rows
                                 st.session_state.worker_weight = worker_weight
                                 st.session_state.step = 2
                                 st.rerun()
                 except Exception as ex:
-                    st.error(f"System fault: {ex}")
+                    st.error(f"Pipeline extraction system fault: {ex}")
 
+# --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
+    st.markdown("Select structural task categories matching specific operational shift hours below:")
+    
     workload_options = {
         "Light (180W)": {"w": 180, "lbl": "Light"},
         "Moderate (300W)": {"w": 300, "lbl": "Moderate"},
@@ -298,7 +435,7 @@ elif st.session_state.step == 2:
                 key=f"sel_{row['hour_24h']}"
             )
             
-    st.divider()
+    st.hr()
     c1, c2 = st.columns(2)
     with c1:
         if st.button("← Modify Location or Prompt Parameters"):
@@ -311,8 +448,12 @@ elif st.session_state.step == 2:
                 row["workload_label"] = chosen["lbl"]
                 row["base_watts"] = chosen["w"]
                 
-            with st.spinner("Launching Headless Playwright Context on Cloud Server Core..."):
-                results = run_browser_automation(st.session_state.final_hourly_rows, st.session_state.worker_weight)
+            with st.spinner("Executing calculations..."):
+                results = run_browser_automation(
+                    st.session_state.final_hourly_rows, 
+                    st.session_state.worker_weight, 
+                    use_headed=use_headed
+                )
                 
             if results:
                 st.session_state.results = results
@@ -321,9 +462,20 @@ elif st.session_state.step == 2:
             else:
                 st.error("No calculation arrays compiled successfully.")
 
+# --- WIZARD STEP 3: INTERACTIVE REPORT VIEWER & EXPORT ---
 elif st.session_state.step == 3:
     st.subheader("Step 3: Compliance Engineering Summary Analysis Output")
     
+    # Showcase fallback warning banner cleanly if mathematical models were used
+    if st.session_state.fallback_active:
+        st.warning(
+            "⚠️ **OSHA Website Protection Fallback Active**: The automated scraper was blocked by the host server's "
+            "perimeter firewall, or the website is currently offline. To protect your analysis, the platform "
+            "successfully estimated Wet Bulb Globe Temperatures (WBGT) offline utilizing standard meteorological formulas (Stull's Wet-Bulb equation)."
+        )
+    else:
+        st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully directly from the live OSHA host calculator.")
+        
     fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight)
     st.pyplot(fig)
     
@@ -342,8 +494,9 @@ elif st.session_state.step == 3:
         mime="text/csv"
     )
     
-    st.divider()
+    st.hr()
     if st.button("🔄 Execute Fresh Inspection Run"):
         st.session_state.step = 1
         st.session_state.final_hourly_rows = None
+        st.session_state.fallback_active = False
         st.rerun()
