@@ -360,7 +360,7 @@ def generate_compliance_plot(results, weight):
 # UI / STREAMLIT
 # =====================================================================
 st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
-st.markdown("Automated localized microclimate timeline extraction and regulatory threshold screening dashboard.")
+st.markdown("AI Agent: Automated localized WBGT reconstruction based on historic weather data from Open-Meteo. Designed by Andre Taylor to be used for regulatory threshold screening.")
 st.divider()
 
 # Configure Engine Sidebar Options
