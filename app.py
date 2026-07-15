@@ -97,7 +97,7 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
     # Convert Temp to Celsius
     tc = (temp_f - 32) * 5.0 / 9.0
     
-    # Estimate Wet Bulb Temperature (Tw) using Stull's equation (highly accurate for standard ranges)
+    # Estimate Wet Bulb Temperature (Tw) using Stull's equation
     rh = rh_pct
     tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) 
           + math.atan(tc + rh) 
@@ -319,7 +319,7 @@ def generate_compliance_plot(results, weight):
 # =====================================================================
 st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
 st.markdown("Automated localized microclimate timeline extraction and regulatory threshold screening dashboard.")
-st.hr()
+st.divider()
 
 # Configure Engine Sidebar Options
 st.sidebar.subheader("Engine Configurations")
@@ -435,7 +435,7 @@ elif st.session_state.step == 2:
                 key=f"sel_{row['hour_24h']}"
             )
             
-    st.hr()
+    st.divider()
     c1, c2 = st.columns(2)
     with c1:
         if st.button("← Modify Location or Prompt Parameters"):
@@ -494,7 +494,7 @@ elif st.session_state.step == 3:
         mime="text/csv"
     )
     
-    st.hr()
+    st.divider()
     if st.button("🔄 Execute Fresh Inspection Run"):
         st.session_state.step = 1
         st.session_state.final_hourly_rows = None
