@@ -94,10 +94,7 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
     Calculates an offline approximation of WBGT using recognized empirical equations.
     Triggers automatically if the OSHA automated scraper is blocked or offline.
     """
-    # Convert Temp to Celsius
     tc = (temp_f - 32) * 5.0 / 9.0
-    
-    # Estimate Wet Bulb Temperature (Tw) using Stull's equation
     rh = rh_pct
     tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) 
           + math.atan(tc + rh) 
@@ -105,25 +102,20 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
           + 0.00391838 * (rh)**1.5 * math.atan(0.023101 * rh) 
           - 4.686035)
     
-    # Estimate Black Globe Temperature (Tg)
     if is_sun:
-        # Sun-exposed globe approximation factoring cooling wind
         wind_ms = max(wind_mph * 0.44704, 0.1)
-        solar_rad = 800.0  # Assumed clear skies solar load
+        solar_rad = 800.0  
         tg_c = tc + 0.015 * solar_rad - 0.12 * wind_ms
         if tg_c < tc:
             tg_c = tc + 2.0
     else:
-        # Shade/Indoor globe temperature
         tg_c = tc + 1.0
         
-    # Combine values using standard weights
     if is_sun:
         wbgt_c = 0.7 * tw + 0.2 * tg_c + 0.1 * tc
     else:
         wbgt_c = 0.7 * tw + 0.3 * tg_c
         
-    # Convert back to Fahrenheit
     wbgt_f = (wbgt_c * 1.8) + 32
     return round(wbgt_f, 1)
 
@@ -138,7 +130,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
     status_text = st.empty()
     st.session_state.fallback_active = False
     
-    # Safeguard headed browser launch on display-less cloud nodes
     actual_headless = not use_headed
     if use_headed and not os.environ.get("DISPLAY"):
         st.warning("⚠️ **Headed Mode Display Warning**: No desktop display environment ($DISPLAY) was detected on this server. Running headlessly to protect application stability.")
@@ -152,7 +143,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
             )
             
-            # Spoof browser identity settings
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800},
@@ -161,8 +151,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
             
             page = context.new_page()
             page.on("dialog", lambda dialog: dialog.dismiss())
-            
-            # Wipe automated driver footprints
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
@@ -170,7 +158,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
                 time.sleep(1.5)
                 
-                # Robust iframe detection
                 target_frame = page
                 for frame in page.frames:
                     try:
@@ -195,7 +182,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                     formatted_time = f"{hour['hour_24h']:02d}:00"
                     target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
                     
-                    # Fill data fields
                     target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
                     target_frame.locator('input[name="tm"]').fill(formatted_time)
                     target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
@@ -257,17 +243,27 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                     status = "WARNING: AL"
                 
                 computed_results.append({
-                    "Time": hour["time_display"], "Air_Temp": f"{hour['temperature_f']}°F", 
-                    "Humidity": f"{hour['relative_humidity_percent']}%", "Sun_WBGT_F": sun_f, 
-                    "Shade_WBGT_F": shade_f, "Workload": hour["workload_label"], 
-                    "Adjusted_Watts": adjusted_watts, "ACGIH_TLV_F": tlv_f, 
-                    "ACGIH_AL_F": al_f, "Safety_Status": status
+                    "Date": hour["date_string_final"],
+                    "Time": hour["time_display"], 
+                    "Latitude": hour["latitude"],
+                    "Longitude": hour["longitude"],
+                    "Air_Temp_F": hour['temperature_f'], 
+                    "Humidity_Pct": hour['relative_humidity_percent'], 
+                    "Wind_Speed_Mph": hour['wind_speed_mph'],
+                    "Pressure_inHg": hour['barometric_pressure_inhg'],
+                    "Sun_WBGT_F": sun_f, 
+                    "Shade_WBGT_F": shade_f, 
+                    "Workload": hour["workload_label"], 
+                    "Adjusted_Watts": adjusted_watts, 
+                    "ACGIH_TLV_F": tlv_f, 
+                    "ACGIH_AL_F": al_f, 
+                    "Safety_Status": status,
+                    "Weather_Source": "Open-Meteo (ERA5 reanalysis)"
                 })
                 
             browser.close()
             
     except Exception as sys_err:
-        # Prevent server crashes if system-level Playwright runtimes block execution
         st.session_state.fallback_active = True
         computed_results = []
         for index, hour in enumerate(hourly_data):
@@ -292,11 +288,22 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 status = "WARNING: AL"
             
             computed_results.append({
-                "Time": hour["time_display"], "Air_Temp": f"{hour['temperature_f']}°F", 
-                "Humidity": f"{hour['relative_humidity_percent']}%", "Sun_WBGT_F": sun_f, 
-                "Shade_WBGT_F": shade_f, "Workload": hour["workload_label"], 
-                "Adjusted_Watts": adjusted_watts, "ACGIH_TLV_F": tlv_f, 
-                "ACGIH_AL_F": al_f, "Safety_Status": status
+                "Date": hour["date_string_final"],
+                "Time": hour["time_display"], 
+                "Latitude": hour["latitude"],
+                "Longitude": hour["longitude"],
+                "Air_Temp_F": hour['temperature_f'], 
+                "Humidity_Pct": hour['relative_humidity_percent'], 
+                "Wind_Speed_Mph": hour['wind_speed_mph'],
+                "Pressure_inHg": hour['barometric_pressure_inhg'],
+                "Sun_WBGT_F": sun_f, 
+                "Shade_WBGT_F": shade_f, 
+                "Workload": hour["workload_label"], 
+                "Adjusted_Watts": adjusted_watts, 
+                "ACGIH_TLV_F": tlv_f, 
+                "ACGIH_AL_F": al_f, 
+                "Safety_Status": status,
+                "Weather_Source": "Open-Meteo (ERA5 reanalysis)"
             })
 
     progress_bar.progress(1.0)
@@ -403,7 +410,6 @@ if st.session_state.step == 1:
                         )
                     )
                     
-                    # Clean markdown tags out of the response if any exist
                     clean_response_text = response.text.replace("```json", "").replace("```", "").strip()
                     intent = UserIntent.model_validate_json(clean_response_text)
                     
@@ -431,7 +437,9 @@ if st.session_state.step == 1:
                                     ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
                                     active_rows.append({
                                         "date_string_final": final_date_str, "time_display": ampm, "hour_24h": hr_int,
-                                        "latitude": geo["latitude"], "longitude_absolute": abs(geo["longitude"]), "tz_value": tz_val,
+                                        "latitude": geo["latitude"], 
+                                        "longitude": geo["longitude"],
+                                        "longitude_absolute": abs(geo["longitude"]), "tz_value": tz_val,
                                         "temperature_f": temps[i], "relative_humidity_percent": int(hums[i]), "wind_speed_mph": winds[i],
                                         "barometric_pressure_inhg": round(press[i] * 0.02953, 2)
                                     })
@@ -501,7 +509,6 @@ elif st.session_state.step == 2:
 elif st.session_state.step == 3:
     st.subheader("Step 3: Compliance Engineering Summary Analysis Output")
     
-    # Showcase fallback warning banner cleanly if mathematical models were used
     if st.session_state.fallback_active:
         st.warning(
             "⚠️ **OSHA Website Protection / Playwright Fallback Active**: The system was unable to scrape the online OSHA calculator "
