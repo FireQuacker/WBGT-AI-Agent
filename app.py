@@ -138,109 +138,146 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
     status_text = st.empty()
     st.session_state.fallback_active = False
     
-    with sync_playwright() as p:
-        status_text.text("Launching browser context...")
-        # Add headless flag conditional on user toggle
-        browser = p.chromium.launch(
-            headless=not use_headed, 
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
-        )
+    # Safeguard headed browser launch on display-less cloud nodes
+    actual_headless = not use_headed
+    if use_headed and not os.environ.get("DISPLAY"):
+        st.warning("⚠️ **Headed Mode Display Warning**: No desktop display environment ($DISPLAY) was detected on this server. Running headlessly to protect application stability.")
+        actual_headless = True
         
-        # Spoof a real browser's profile to bypass basic automation filters
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            locale="en-US"
-        )
-        
-        page = context.new_page()
-        page.on("dialog", lambda dialog: dialog.dismiss())
-        
-        # Eliminate the webdriver parameter that triggers WAF (Web Application Firewalls)
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
-        try:
-            page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+    try:
+        with sync_playwright() as p:
+            status_text.text("Launching browser context...")
+            browser = p.chromium.launch(
+                headless=actual_headless, 
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+            )
             
-            # Allow time for iframe rendering
-            time.sleep(2)
+            # Spoof browser identity settings
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                locale="en-US"
+            )
             
-            # Robust dynamic iframe discovery
-            target_frame = page
-            for frame in page.frames:
-                try:
-                    frame.locator('input[name="temp"]').wait_for(state="attached", timeout=1500)
-                    target_frame = frame
-                    break
-                except:
-                    continue
-        except Exception as conn_error:
-            st.warning(f"Connection warning: {conn_error}. Attempting calculations directly.")
-            target_frame = page
-
-        total_rows = len(hourly_data)
-        for index, hour in enumerate(hourly_data):
-            status_text.text(f"Scraping OSHA Calculator for hour: {hour['time_display']} ({index+1}/{total_rows})...")
-            progress_bar.progress((index) / total_rows)
+            page = context.new_page()
+            page.on("dialog", lambda dialog: dialog.dismiss())
             
-            # Flag used to track if this specific iteration requires the offline mathematical fallback
-            row_fallback = False
-            sun_f, shade_f = 0.0, 0.0
+            # Wipe automated driver footprints
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
+            target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
             try:
-                formatted_time = f"{hour['hour_24h']:02d}:00"
-                target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
+                page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+                time.sleep(1.5)
                 
-                # Fill input fields
-                target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
-                target_frame.locator('input[name="tm"]').fill(formatted_time)
-                target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
-                target_frame.locator('input[name="lon"]').fill(str(hour["longitude_absolute"]))
-                target_frame.locator('input[name="temp"]').fill(str(hour['temperature_f']))
-                target_frame.locator('input[name="rh"]').fill(str(hour['relative_humidity_percent']))
-                target_frame.locator('input[name="ws"]').fill(str(hour['wind_speed_mph']))
-                target_frame.locator('input[name="pres"]').fill(str(hour['barometric_pressure_inhg']))
-                
-                try: 
-                    target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
-                except: 
-                    pass
-                try: 
-                    target_frame.locator('select[name="tz"]').select_option(label=target_label, timeout=100)
-                except: 
-                    pass
-                
-                time.sleep(0.1)
-                target_frame.locator('input[value="Submit"]').click()
-                
-                sun_wbgt, shade_wbgt = "---", "---"
-                for _ in range(30):  
-                    time.sleep(0.1)
-                    live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
-                    if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
-                        sun_wbgt = live_sun_val.strip()
-                        shade_wbgt = target_frame.locator('input[name="wbgt_shade"]').input_value().strip()
+                # Robust iframe detection
+                target_frame = page
+                for frame in page.frames:
+                    try:
+                        frame.locator('input[name="temp"]').wait_for(state="attached", timeout=1200)
+                        target_frame = frame
                         break
+                    except:
+                        continue
+            except Exception as conn_error:
+                st.warning(f"Connection warning: {conn_error}. Attempting calculations directly.")
+                target_frame = page
+
+            total_rows = len(hourly_data)
+            for index, hour in enumerate(hourly_data):
+                status_text.text(f"Scraping OSHA Calculator for hour: {hour['time_display']} ({index+1}/{total_rows})...")
+                progress_bar.progress((index) / total_rows)
                 
-                if "/" in sun_wbgt:
-                    sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip())
-                    shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip())
-                else:
+                row_fallback = False
+                sun_f, shade_f = 0.0, 0.0
+                
+                try:
+                    formatted_time = f"{hour['hour_24h']:02d}:00"
+                    target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
+                    
+                    # Fill data fields
+                    target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
+                    target_frame.locator('input[name="tm"]').fill(formatted_time)
+                    target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
+                    target_frame.locator('input[name="lon"]').fill(str(hour["longitude_absolute"]))
+                    target_frame.locator('input[name="temp"]').fill(str(hour['temperature_f']))
+                    target_frame.locator('input[name="rh"]').fill(str(hour['relative_humidity_percent']))
+                    target_frame.locator('input[name="ws"]').fill(str(hour['wind_speed_mph']))
+                    target_frame.locator('input[name="pres"]').fill(str(hour['barometric_pressure_inhg']))
+                    
+                    try: 
+                        target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
+                    except: 
+                        pass
+                    try: 
+                        target_frame.locator('select[name="tz"]').select_option(label=target_label, timeout=100)
+                    except: 
+                        pass
+                    
+                    time.sleep(0.1)
+                    target_frame.locator('input[value="Submit"]').click()
+                    
+                    sun_wbgt, shade_wbgt = "---", "---"
+                    for _ in range(30):  
+                        time.sleep(0.1)
+                        live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
+                        if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
+                            sun_wbgt = live_sun_val.strip()
+                            shade_wbgt = target_frame.locator('input[name="wbgt_shade"]').input_value().strip()
+                            break
+                    
+                    if "/" in sun_wbgt:
+                        sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip())
+                        shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip())
+                    else:
+                        row_fallback = True
+                except Exception:
                     row_fallback = True
-            except Exception:
-                row_fallback = True
-            
-            # Apply mathematical fallback calculation if scraping fails
-            if row_fallback:
-                st.session_state.fallback_active = True
-                sun_f = calculate_wbgt_meteorological_fallback(
-                    hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=True
-                )
-                shade_f = calculate_wbgt_meteorological_fallback(
-                    hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=False
-                )
                 
+                if row_fallback:
+                    st.session_state.fallback_active = True
+                    sun_f = calculate_wbgt_meteorological_fallback(
+                        hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=True
+                    )
+                    shade_f = calculate_wbgt_meteorological_fallback(
+                        hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=False
+                    )
+                    
+                adjusted_watts = round((hour["base_watts"] * weight) / 154.0, 1)
+                tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
+                al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
+                
+                tlv_f = round((tlv_c * 1.8) + 32, 1)
+                al_f = round((al_c * 1.8) + 32, 1)
+                
+                status = "Normal"
+                if sun_f > tlv_f or shade_f > tlv_f: 
+                    status = "BREACH: TLV"
+                elif sun_f > al_f or shade_f > al_f: 
+                    status = "WARNING: AL"
+                
+                computed_results.append({
+                    "Time": hour["time_display"], "Air_Temp": f"{hour['temperature_f']}°F", 
+                    "Humidity": f"{hour['relative_humidity_percent']}%", "Sun_WBGT_F": sun_f, 
+                    "Shade_WBGT_F": shade_f, "Workload": hour["workload_label"], 
+                    "Adjusted_Watts": adjusted_watts, "ACGIH_TLV_F": tlv_f, 
+                    "ACGIH_AL_F": al_f, "Safety_Status": status
+                })
+                
+            browser.close()
+            
+    except Exception as sys_err:
+        # Prevent server crashes if system-level Playwright runtimes block execution
+        st.session_state.fallback_active = True
+        computed_results = []
+        for index, hour in enumerate(hourly_data):
+            sun_f = calculate_wbgt_meteorological_fallback(
+                hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=True
+            )
+            shade_f = calculate_wbgt_meteorological_fallback(
+                hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=False
+            )
+            
             adjusted_watts = round((hour["base_watts"] * weight) / 154.0, 1)
             tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
             al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
@@ -261,11 +298,9 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 "Adjusted_Watts": adjusted_watts, "ACGIH_TLV_F": tlv_f, 
                 "ACGIH_AL_F": al_f, "Safety_Status": status
             })
-            
-        browser.close()
-        progress_bar.progress(1.0)
-        status_text.text("Processing operation completed successfully.")
-        
+
+    progress_bar.progress(1.0)
+    status_text.text("Processing operation completed successfully.")
     return computed_results
 
 # =====================================================================
@@ -469,8 +504,8 @@ elif st.session_state.step == 3:
     # Showcase fallback warning banner cleanly if mathematical models were used
     if st.session_state.fallback_active:
         st.warning(
-            "⚠️ **OSHA Website Protection Fallback Active**: The automated scraper was blocked by the host server's "
-            "perimeter firewall, or the website is currently offline. To protect your analysis, the platform "
+            "⚠️ **OSHA Website Protection / Playwright Fallback Active**: The system was unable to scrape the online OSHA calculator "
+            "(due to cloud display restrictions, server blockades, or service downtime). To protect your analysis, the platform "
             "successfully estimated Wet Bulb Globe Temperatures (WBGT) offline utilizing standard meteorological formulas (Stull's Wet-Bulb equation)."
         )
     else:
