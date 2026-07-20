@@ -178,33 +178,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 row_fallback = False
                 sun_f, shade_f = 0.0, 0.0
                 
-                # --- DATA CLAMPING & NOTES GENERATION ---
-                orig_temp = float(hour['temperature_f'])
-                orig_rh   = int(hour['relative_humidity_percent'])
-                orig_ws   = float(hour['wind_speed_mph'])
-                orig_pres = float(hour['barometric_pressure_inhg'])
-
-                safe_temp = max(min(orig_temp, 120.0), 32.0)
-                safe_rh   = max(min(orig_rh, 100), 1)
-                safe_ws   = max(min(orig_ws, 50.0), 0.0)
-                safe_pres = max(min(orig_pres, 32.0), 25.0)
-
-                notes_list = []
-                if orig_temp < 32.0: notes_list.append(f"Air Temp rounded up to 32.0 °F")
-                elif orig_temp > 120.0: notes_list.append(f"Air Temp rounded down to 120.0 °F")
-                
-                if orig_rh < 1: notes_list.append(f"RH rounded up to 1%")
-                elif orig_rh > 100: notes_list.append(f"RH rounded down to 100%")
-
-                if orig_ws < 0.0: notes_list.append(f"Wind Speed rounded up to 0.0 mph")
-                elif orig_ws > 50.0: notes_list.append(f"Wind Speed rounded down to 50.0 mph")
-
-                if orig_pres < 25.0: notes_list.append(f"Pressure rounded up to 25.0 inHg")
-                elif orig_pres > 32.0: notes_list.append(f"Pressure rounded down to 32.0 inHg")
-
-                notes_str = " | ".join(notes_list) if notes_list else "None"
-                # ----------------------------------------
-                
                 try:
                     formatted_time = f"{hour['hour_24h']:02d}:00"
                     target_label = tz_labels.get(hour["tz_value"], "Eastern Time")
@@ -213,12 +186,10 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                     target_frame.locator('input[name="tm"]').fill(formatted_time)
                     target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
                     target_frame.locator('input[name="lon"]').fill(str(hour["longitude_absolute"]))
-                    
-                    # Pass the SAFE values into the browser automation
-                    target_frame.locator('input[name="temp"]').fill(str(safe_temp))
-                    target_frame.locator('input[name="rh"]').fill(str(safe_rh))
-                    target_frame.locator('input[name="ws"]').fill(str(safe_ws))
-                    target_frame.locator('input[name="pres"]').fill(str(safe_pres))
+                    target_frame.locator('input[name="temp"]').fill(str(hour['temperature_f']))
+                    target_frame.locator('input[name="rh"]').fill(str(hour['relative_humidity_percent']))
+                    target_frame.locator('input[name="ws"]').fill(str(hour['wind_speed_mph']))
+                    target_frame.locator('input[name="pres"]').fill(str(hour['barometric_pressure_inhg']))
                     
                     try: 
                         target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
@@ -257,10 +228,6 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                     shade_f = calculate_wbgt_meteorological_fallback(
                         hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=False
                     )
-                    if notes_str == "None":
-                        notes_str = "Offline Stull Fallback Used"
-                    else:
-                        notes_str = notes_str + " | Offline Stull Fallback Used"
                     
                 adjusted_watts = round((hour["base_watts"] * weight) / 154.0, 1)
                 tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
@@ -280,10 +247,10 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                     "Time": hour["time_display"], 
                     "Latitude": hour["latitude"],
                     "Longitude": hour["longitude"],
-                    "Air_Temp_F": orig_temp, 
-                    "Humidity_Pct": orig_rh, 
-                    "Wind_Speed_Mph": orig_ws,
-                    "Pressure_inHg": orig_pres,
+                    "Air_Temp_F": hour['temperature_f'], 
+                    "Humidity_Pct": hour['relative_humidity_percent'], 
+                    "Wind_Speed_Mph": hour['wind_speed_mph'],
+                    "Pressure_inHg": hour['barometric_pressure_inhg'],
                     "Sun_WBGT_F": sun_f, 
                     "Shade_WBGT_F": shade_f, 
                     "Workload": hour["workload_label"], 
@@ -291,8 +258,7 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                     "ACGIH_TLV_F": tlv_f, 
                     "ACGIH_AL_F": al_f, 
                     "Safety_Status": status,
-                    "Weather_Source": "Open-Meteo (Copernicus ERA5 Reanalysis)",
-                    "Notes": notes_str
+                    "Weather_Source": "Open-Meteo (Copernicus ERA5 Reanalysis)"
                 })
                 
             browser.close()
@@ -301,37 +267,11 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
         st.session_state.fallback_active = True
         computed_results = []
         for index, hour in enumerate(hourly_data):
-            # Evaluate clamping notes even on complete failure for export consistency
-            orig_temp = float(hour['temperature_f'])
-            orig_rh   = int(hour['relative_humidity_percent'])
-            orig_ws   = float(hour['wind_speed_mph'])
-            orig_pres = float(hour['barometric_pressure_inhg'])
-
-            notes_list = []
-            if orig_temp < 32.0: notes_list.append(f"Air Temp rounded up to 32.0 °F")
-            elif orig_temp > 120.0: notes_list.append(f"Air Temp rounded down to 120.0 °F")
-            
-            if orig_rh < 1: notes_list.append(f"RH rounded up to 1%")
-            elif orig_rh > 100: notes_list.append(f"RH rounded down to 100%")
-
-            if orig_ws < 0.0: notes_list.append(f"Wind Speed rounded up to 0.0 mph")
-            elif orig_ws > 50.0: notes_list.append(f"Wind Speed rounded down to 50.0 mph")
-
-            if orig_pres < 25.0: notes_list.append(f"Pressure rounded up to 25.0 inHg")
-            elif orig_pres > 32.0: notes_list.append(f"Pressure rounded down to 32.0 inHg")
-
-            notes_str = " | ".join(notes_list) if notes_list else "None"
-            
-            if notes_str == "None":
-                notes_str = "Offline Stull Fallback Used"
-            else:
-                notes_str = notes_str + " | Offline Stull Fallback Used"
-
             sun_f = calculate_wbgt_meteorological_fallback(
-                orig_temp, orig_rh, orig_ws, is_sun=True
+                hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=True
             )
             shade_f = calculate_wbgt_meteorological_fallback(
-                orig_temp, orig_rh, orig_ws, is_sun=False
+                hour['temperature_f'], hour['relative_humidity_percent'], hour['wind_speed_mph'], is_sun=False
             )
             
             adjusted_watts = round((hour["base_watts"] * weight) / 154.0, 1)
@@ -352,10 +292,10 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 "Time": hour["time_display"], 
                 "Latitude": hour["latitude"],
                 "Longitude": hour["longitude"],
-                "Air_Temp_F": orig_temp, 
-                "Humidity_Pct": orig_rh, 
-                "Wind_Speed_Mph": orig_ws,
-                "Pressure_inHg": orig_pres,
+                "Air_Temp_F": hour['temperature_f'], 
+                "Humidity_Pct": hour['relative_humidity_percent'], 
+                "Wind_Speed_Mph": hour['wind_speed_mph'],
+                "Pressure_inHg": hour['barometric_pressure_inhg'],
                 "Sun_WBGT_F": sun_f, 
                 "Shade_WBGT_F": shade_f, 
                 "Workload": hour["workload_label"], 
@@ -363,8 +303,7 @@ def run_browser_automation(hourly_data, weight, use_headed=False):
                 "ACGIH_TLV_F": tlv_f, 
                 "ACGIH_AL_F": al_f, 
                 "Safety_Status": status,
-                "Weather_Source": "Open-Meteo (Copernicus ERA5 Reanalysis)",
-                "Notes": notes_str
+                "Weather_Source": "Open-Meteo (Copernicus ERA5 Reanalysis)"
             })
 
     progress_bar.progress(1.0)
