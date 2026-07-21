@@ -95,9 +95,9 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
     except Exception as e:
         print(f"Census API attempt failed, cascading to Mapbox: {e}")
 
-    # 3. Fallback Route: Mapbox API (Highly accurate, requires free tier key)
+    # 3. Fallback Route: Mapbox API (Highly accurate, securely pulls from secrets)
     if not mapbox_key:
-        return {"error": "US Census database could not pinpoint this exact address. Please enter a Mapbox API Key in the sidebar to enable the high-accuracy fallback geocoder."}
+        return {"error": "US Census database could not pinpoint this exact address. Please add MAPBOX_API_KEY to your Streamlit cloud secrets settings to enable the high-accuracy fallback geocoder."}
     
     try:
         encoded_address = urllib.parse.quote(address)
@@ -479,17 +479,23 @@ use_headed = st.sidebar.checkbox(
     help="Turn this on when running LOCALLY to see the browser window perform live data-entry automation. Keep unchecked on cloud environments."
 )
 
+# --- SECRETS MANAGEMENT PIPELINE ---
+# Check OS Env, then Streamlit Secrets for Gemini
 api_key_env = os.environ.get("GEMINI_API_KEY", "")
+if not api_key_env and "GEMINI_API_KEY" in st.secrets:
+    api_key_env = st.secrets["GEMINI_API_KEY"]
+    os.environ["GEMINI_API_KEY"] = api_key_env
+
 if not api_key_env:
     api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
     if api_key_input:
         os.environ["GEMINI_API_KEY"] = api_key_input
 
-mapbox_key_env = os.environ.get("MAPBOX_API_KEY", "")
-if not mapbox_key_env:
-    mapbox_key_input = st.sidebar.text_input("Enter Mapbox API Key (Optional Geocoding Fallback)", type="password")
-    if mapbox_key_input:
-        os.environ["MAPBOX_API_KEY"] = mapbox_key_input
+# Check OS Env, then Streamlit Secrets for Mapbox
+mapbox_secret = os.environ.get("MAPBOX_API_KEY", "")
+if not mapbox_secret and "MAPBOX_API_KEY" in st.secrets:
+    mapbox_secret = st.secrets["MAPBOX_API_KEY"]
+
 
 # --- WIZARD STEP 1: PARSE USER INTENT & HISTORICAL WEATHER MATRIX ---
 if st.session_state.step == 1:
@@ -527,8 +533,8 @@ if st.session_state.step == 1:
                     clean_response_text = response.text.replace("```json", "").replace("```", "").strip()
                     intent = UserIntent.model_validate_json(clean_response_text)
                     
-                    # Call the new cascade geocoder and pass the Mapbox key if available
-                    geo = geocode_address_native(intent.address, os.environ.get("MAPBOX_API_KEY", ""))
+                    # Pass the successfully retrieved secret into the cascade geocoder
+                    geo = geocode_address_native(intent.address, mapbox_secret)
                     
                     if "error" in geo:
                         st.error(geo["error"])
