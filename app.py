@@ -315,6 +315,17 @@ def generate_compliance_plot(results):
     al_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     
     fig, ax = plt.subplots(figsize=(11, 6.5))
+    
+    # Calculate y-axis bounds for shading to ensure the whole envelope is covered
+    all_wbgt_points = [r["Sun_WBGT_F"] for r in results] + [r["Shade_WBGT_F"] for r in results]
+    y_max = max(max(tlv_curve_f) + 10, max(all_wbgt_points) + 5 if all_wbgt_points else max(tlv_curve_f) + 10)
+    y_min = min(min(al_curve_f) - 10, min(all_wbgt_points) - 5 if all_wbgt_points else min(al_curve_f) - 10)
+    
+    # Add dynamic shading
+    ax.fill_between(watts_range, y_min, al_curve_f, color='green', alpha=0.1, label='Compliant / Safe Zone')
+    ax.fill_between(watts_range, al_curve_f, tlv_curve_f, color='orange', alpha=0.15, label='Caution (Exceeds AL)')
+    ax.fill_between(watts_range, tlv_curve_f, y_max, color='red', alpha=0.1, label='Breach (Exceeds TLV)')
+    
     ax.plot(watts_range, tlv_curve_f, color='crimson', linestyle='-', linewidth=2.5, label='ACGIH TLV (Acclimatized Limit)')
     ax.plot(watts_range, al_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label='ACGIH Action Limit (Unacclimatized)')
     
@@ -332,8 +343,11 @@ def generate_compliance_plot(results):
     ax.set_title("ACGIH Heat Stress Analytical Assessment Plot", fontsize=12, fontweight='bold')
     ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
     ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
+    
+    # Apply calculated limits
     ax.set_xlim(90, 610)
-    ax.set_ylim(min(al_curve_f) - 5, max(tlv_curve_f) + 5)
+    ax.set_ylim(y_min, y_max)
+    
     ax.grid(True, linestyle=':', alpha=0.5)
     ax.legend(loc='upper right', framealpha=0.9)
     return fig
