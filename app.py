@@ -238,7 +238,6 @@ def run_browser_automation(hourly_data, use_headed=False):
                     shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
                     notes_str = "Offline Stull Fallback Used" if notes_str == "None" else notes_str + " | Offline Stull Fallback Used"
                     
-                # Calculate thresholds based on the exact Watts generated in Step 2
                 adjusted_watts = hour["final_watts"]
                 tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
                 al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
@@ -309,23 +308,20 @@ def run_browser_automation(hourly_data, use_headed=False):
 # =====================================================================
 # MATPLOTLIB GRAPHICS COMPLIANCE GENERATOR
 # =====================================================================
-def generate_compliance_plot(results):
-    watts_range = np.linspace(100, 600, 500)
+def generate_compliance_plot(results, worker_weight):
+    watts_range = np.linspace(90, 610, 500)
     tlv_curve_f = [(56.7 - (11.5 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     al_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     
     fig, ax = plt.subplots(figsize=(11, 6.5))
     
-    # Calculate y-axis bounds for shading to ensure the whole envelope is covered
-    all_wbgt_points = [r["Sun_WBGT_F"] for r in results] + [r["Shade_WBGT_F"] for r in results]
-    y_max = max(max(tlv_curve_f) + 10, max(all_wbgt_points) + 5 if all_wbgt_points else max(tlv_curve_f) + 10)
-    y_min = min(min(al_curve_f) - 10, min(all_wbgt_points) - 5 if all_wbgt_points else min(al_curve_f) - 10)
+    # Add vertical standard workload reference lines
+    standard_w = {180: "Light (180W)", 300: "Moderate (300W)", 415: "Heavy (415W)", 520: "Very Heavy (520W)"}
+    for w_val, label in standard_w.items():
+        ax.axvline(x=w_val, color='grey', linestyle=':', alpha=0.4)
+        ax.text(w_val + 4, 66, label, rotation=90, color='grey', alpha=0.6, fontsize=9, va='bottom')
     
-    # Add dynamic shading
-    ax.fill_between(watts_range, y_min, al_curve_f, color='green', alpha=0.1, label='Compliant / Safe Zone')
-    ax.fill_between(watts_range, al_curve_f, tlv_curve_f, color='orange', alpha=0.15, label='Caution (Exceeds AL)')
-    ax.fill_between(watts_range, tlv_curve_f, y_max, color='red', alpha=0.1, label='Breach (Exceeds TLV)')
-    
+    # Plot ACGIH mathematical curves
     ax.plot(watts_range, tlv_curve_f, color='crimson', linestyle='-', linewidth=2.5, label='ACGIH TLV (Acclimatized Limit)')
     ax.plot(watts_range, al_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label='ACGIH Action Limit (Unacclimatized)')
     
@@ -333,20 +329,44 @@ def generate_compliance_plot(results):
     y_sun = [r["Sun_WBGT_F"] for r in results]
     y_shade = [r["Shade_WBGT_F"] for r in results]
     
+    # Dynamically draw the Shift Exposure Envelope Box
+    if x_watts:
+        min_w, max_w = min(x_watts), max(x_watts)
+        min_wbgt, max_wbgt = min(y_shade + y_sun), max(y_shade + y_sun)
+        
+        # Determine appropriate padding for the box
+        w_padding = 30 if (max_w - min_w) < 20 else 20
+        box_x = min_w - w_padding
+        box_w = (max_w - min_w) + (w_padding * 2)
+        box_y = min_wbgt - 1.5
+        box_h = (max_wbgt - min_wbgt) + 3.0
+        
+        rect = patches.Rectangle((box_x, box_y), box_w, box_h,
+                                 linewidth=1.5, edgecolor='none', facecolor='#E6D8E7', alpha=0.4,
+                                 label='Shift Exposure Envelope Box')
+        ax.add_patch(rect)
+    
+    # Plot scatter points
     ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
     ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
     
+    # Annotate time over each point
     for i, r in enumerate(results):
         ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
         ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
 
-    ax.set_title("ACGIH Heat Stress Analytical Assessment Plot", fontsize=12, fontweight='bold')
+    # Add weight reference to title
+    ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=12, fontweight='bold')
     ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
     ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
     
-    # Apply calculated limits
+    # Set explicit plot bounds
     ax.set_xlim(90, 610)
-    ax.set_ylim(y_min, y_max)
+    
+    # Dynamically scale Y-axis bounds based on recorded temperatures, minimum floor of 65
+    y_min_bound = 65
+    y_max_bound = max(98, max_wbgt + 5 if x_watts else 98)
+    ax.set_ylim(y_min_bound, y_max_bound)
     
     ax.grid(True, linestyle=':', alpha=0.5)
     ax.legend(loc='upper right', framealpha=0.9)
@@ -516,7 +536,7 @@ elif st.session_state.step == 3:
     if st.session_state.fallback_active: st.warning("⚠️ **Playwright Fallback Active**: The system successfully estimated WBGT offline utilizing Stull's equation.")
     else: st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
         
-    fig = generate_compliance_plot(st.session_state.results)
+    fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight)
     st.pyplot(fig)
     
     st.subheader("Raw Exposure Tracking Metrics Matrix")
