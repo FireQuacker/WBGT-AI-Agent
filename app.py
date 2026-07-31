@@ -256,6 +256,9 @@ def run_browser_automation(hourly_data, use_headed=False):
                     "Longitude": hour["longitude"],
                     "Air_Temp_F": orig_temp, 
                     "Humidity_Pct": orig_rh, 
+                    "Wind_Speed_mph": orig_ws,
+                    "Barometric_Pressure_inHg": orig_pres,
+                    "Weather_Data_Source": "Open-Meteo Archive",
                     "Sun_WBGT_F": sun_f, 
                     "Shade_WBGT_F": shade_f, 
                     "Workload": hour["workload_label"], 
@@ -273,6 +276,7 @@ def run_browser_automation(hourly_data, use_headed=False):
         computed_results = []
         for index, hour in enumerate(hourly_data):
             orig_temp, orig_rh, orig_ws = float(hour['temperature_f']), int(hour['relative_humidity_percent']), float(hour['wind_speed_mph'])
+            orig_pres = float(hour['barometric_pressure_inhg'])
             sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=True)
             shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
             
@@ -291,6 +295,9 @@ def run_browser_automation(hourly_data, use_headed=False):
                 "Time": hour["time_display"], 
                 "Air_Temp_F": orig_temp, 
                 "Humidity_Pct": orig_rh, 
+                "Wind_Speed_mph": orig_ws,
+                "Barometric_Pressure_inHg": orig_pres,
+                "Weather_Data_Source": "Open-Meteo Archive",
                 "Sun_WBGT_F": sun_f, 
                 "Shade_WBGT_F": shade_f, 
                 "Workload": hour["workload_label"], 
@@ -376,7 +383,7 @@ def generate_compliance_plot(results, worker_weight):
 # UI / STREAMLIT
 # =====================================================================
 st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
-st.markdown("AI Agent: Automated localized WBGT reconstruction based on historic weather data from Open-Meteo. Designed by Andre Taylor to be used for regulatory threshold screening.")
+st.markdown("Designed by Andre Taylor to be used for regulatory threshold screening. AI Agent: Automated localized WBGT reconstruction based on historic weather data from Open-Meteo. ")
 st.divider()
 
 st.sidebar.subheader("Engine Configurations")
