@@ -23,10 +23,7 @@ import csv
 import io
 import requests
 import urllib.parse
-from datetime import datetime
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field
+from datetime import datetime, date
 from playwright.sync_api import sync_playwright
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -35,7 +32,7 @@ import numpy as np
 # =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
 # =====================================================================
-st.set_page_config(page_title="OSHA Heat Stress Dashboard", layout="wide")
+st.set_page_config(page_title="OSHA-WBGT Localized Calculator", layout="wide")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -47,14 +44,8 @@ if "fallback_active" not in st.session_state:
     st.session_state.fallback_active = False
 
 # =====================================================================
-# INTENT EXTRACTION SCHEMA & UTILITIES
+# GEOCODING & METEOROLOGICAL UTILITIES
 # =====================================================================
-class UserIntent(BaseModel):
-    address: str = Field(description="The physical address, city, or location requested.")
-    date: str = Field(description="The requested date converted into strict YYYY-MM-DD format.")
-    start_hour_24h: int = Field(description="The starting hour extracted and converted to 24-hour integer format (0-23).")
-    end_hour_24h: int = Field(description="The ending hour extracted and converted to 24-hour integer format (0-23).")
-
 def get_osha_tz_value(lon: float) -> str:
     if lon >= -85.5: return "-5"
     elif lon >= -103.5: return "-6"
@@ -87,7 +78,7 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
         print(f"Census API attempt failed: {e}")
 
     if not mapbox_key:
-        return {"error": "US Census database could not pinpoint this exact address. Please add MAPBOX_API_KEY to your Streamlit cloud secrets settings."}
+        return {"error": "US Census database could not pinpoint this address. Please add MAPBOX_API_KEY to your Streamlit secrets settings."}
     
     try:
         encoded_address = urllib.parse.quote(address)
@@ -145,7 +136,6 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
 # WEB AUTOMATION BACKEND ENGINE
 # =====================================================================
 def run_browser_automation(hourly_data, use_headed=False):
-    tz_labels = {"-5": "Eastern Time", "-6": "Central Time", "-7": "Mountain Time", "-8": "Pacific Time", "-9": "Alaska", "-10": "Hawaii"}
     computed_results = []
     
     progress_bar = st.progress(0)
@@ -249,6 +239,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                 if sun_f > tlv_f or shade_f > tlv_f: status = "BREACH: TLV"
                 elif sun_f > al_f or shade_f > al_f: status = "WARNING: AL"
                 
+                # Prioritized dictionary output order
                 computed_results.append({
                     "Date": hour["date_string_final"],
                     "Time": hour["time_display"], 
@@ -258,7 +249,6 @@ def run_browser_automation(hourly_data, use_headed=False):
                     "Humidity_Pct": orig_rh, 
                     "Wind_Speed_mph": orig_ws,
                     "Barometric_Pressure_inHg": orig_pres,
-                    "Weather_Data_Source": "Open-Meteo Archive",
                     "Sun_WBGT_F": sun_f, 
                     "Shade_WBGT_F": shade_f, 
                     "Workload": hour["workload_label"], 
@@ -266,6 +256,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                     "ACGIH_TLV_F": tlv_f, 
                     "ACGIH_AL_F": al_f, 
                     "Safety_Status": status,
+                    "Weather_Data_Source": "Open-Meteo Archive",
                     "Notes": notes_str
                 })
                 
@@ -293,11 +284,12 @@ def run_browser_automation(hourly_data, use_headed=False):
             computed_results.append({
                 "Date": hour["date_string_final"],
                 "Time": hour["time_display"], 
+                "Latitude": hour["latitude"],
+                "Longitude": hour["longitude"],
                 "Air_Temp_F": orig_temp, 
                 "Humidity_Pct": orig_rh, 
                 "Wind_Speed_mph": orig_ws,
                 "Barometric_Pressure_inHg": orig_pres,
-                "Weather_Data_Source": "Open-Meteo Archive",
                 "Sun_WBGT_F": sun_f, 
                 "Shade_WBGT_F": shade_f, 
                 "Workload": hour["workload_label"], 
@@ -305,6 +297,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                 "ACGIH_TLV_F": tlv_f, 
                 "ACGIH_AL_F": al_f, 
                 "Safety_Status": status,
+                "Weather_Data_Source": "Open-Meteo Archive",
                 "Notes": "Offline Stull Fallback Used"
             })
 
@@ -322,13 +315,11 @@ def generate_compliance_plot(results, worker_weight):
     
     fig, ax = plt.subplots(figsize=(11, 6.5))
     
-    # Add vertical standard workload reference lines
     standard_w = {180: "Light (180W)", 300: "Moderate (300W)", 415: "Heavy (415W)", 520: "Very Heavy (520W)"}
     for w_val, label in standard_w.items():
         ax.axvline(x=w_val, color='grey', linestyle=':', alpha=0.4)
         ax.text(w_val + 4, 66, label, rotation=90, color='grey', alpha=0.6, fontsize=9, va='bottom')
     
-    # Plot ACGIH mathematical curves
     ax.plot(watts_range, tlv_curve_f, color='crimson', linestyle='-', linewidth=2.5, label='ACGIH TLV (Acclimatized Limit)')
     ax.plot(watts_range, al_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label='ACGIH Action Limit (Unacclimatized)')
     
@@ -336,12 +327,10 @@ def generate_compliance_plot(results, worker_weight):
     y_sun = [r["Sun_WBGT_F"] for r in results]
     y_shade = [r["Shade_WBGT_F"] for r in results]
     
-    # Dynamically draw the Shift Exposure Envelope Box
     if x_watts:
         min_w, max_w = min(x_watts), max(x_watts)
         min_wbgt, max_wbgt = min(y_shade + y_sun), max(y_shade + y_sun)
         
-        # Determine appropriate padding for the box
         w_padding = 30 if (max_w - min_w) < 20 else 20
         box_x = min_w - w_padding
         box_w = (max_w - min_w) + (w_padding * 2)
@@ -353,24 +342,19 @@ def generate_compliance_plot(results, worker_weight):
                                  label='Shift Exposure Envelope Box')
         ax.add_patch(rect)
     
-    # Plot scatter points
     ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
     ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
     
-    # Annotate time over each point
     for i, r in enumerate(results):
         ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
         ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
 
-    # Add weight reference to title
     ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=12, fontweight='bold')
     ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
     ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
     
-    # Set explicit plot bounds
     ax.set_xlim(90, 610)
     
-    # Dynamically scale Y-axis bounds based on recorded temperatures, minimum floor of 65
     y_min_bound = 65
     y_max_bound = max(98, max_wbgt + 5 if x_watts else 98)
     ax.set_ylim(y_min_bound, y_max_bound)
@@ -380,60 +364,52 @@ def generate_compliance_plot(results, worker_weight):
     return fig
 
 # =====================================================================
-# UI / STREAMLIT
+# UI / STREAMLIT APP ENGINE
 # =====================================================================
-st.title("☀️ OSHA-WBGT & ACGIH Heat Stress Compliance Engine")
-st.markdown("Designed by Andre Taylor to be used for regulatory threshold screening. AI Agent: Automated localized WBGT reconstruction based on historic weather data from Open-Meteo. ")
+st.title("☀️ OSHA-WBGT Localized Calculator")
+st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
 st.divider()
 
-st.sidebar.subheader("Engine Configurations")
+st.sidebar.subheader("System Configurations")
 use_headed = st.sidebar.checkbox("Open Visible Browser Mode (Headed)", value=False)
-
-api_key_env = os.environ.get("GEMINI_API_KEY", st.secrets.get("GEMINI_API_KEY", ""))
-if not api_key_env:
-    api_key_input = st.sidebar.text_input("Enter Gemini API Key", type="password")
-    if api_key_input: os.environ["GEMINI_API_KEY"] = api_key_input
-else:
-    os.environ["GEMINI_API_KEY"] = api_key_env
-
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
 
-# --- WIZARD STEP 1: PARSE USER INTENT & HISTORICAL WEATHER MATRIX ---
+# --- WIZARD STEP 1: UI-BASED TARGET PARAMETER INPUTS ---
 if st.session_state.step == 1:
     st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
-    col1, col2 = st.columns([3, 1])
+    col1, col2 = st.columns([2, 1])
     with col1:
-        user_prompt = st.text_area("What location and date timeline do you need evaluated?", placeholder="e.g., Check weather parameters for Dallas, Texas on August 12th, 2025 from 8 AM to 4 PM.")
+        target_address = st.text_input("Inspection / Worksite Location", value="Dallas, TX", help="Enter a street address, city, state, or ZIP code.")
+        target_date = st.date_input("Inspection Date", value=date(2025, 8, 12))
     with col2:
+        start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
         worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
-    if st.button("Analyze Shift Timeline", type="primary"):
-        if not os.environ.get("GEMINI_API_KEY"): st.error("Please supply a valid Gemini API Token.")
-        elif not user_prompt.strip(): st.warning("Please type an engineering assessment request string.")
+    if st.button("Fetch Historical Weather Data", type="primary"):
+        if not target_address.strip():
+            st.warning("Please supply a valid location or address.")
         else:
-            with st.spinner("Synthesizing context parameters via Gemini Core Engine..."):
-                client = genai.Client()
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash", contents=user_prompt.strip(),
-                    config=types.GenerateContentConfig(system_instruction="Extract location, date (YYYY-MM-DD), and 24h clock constraints.", response_mime_type="application/json", response_schema=UserIntent)
-                )
-                intent = UserIntent.model_validate_json(response.text.replace("```json", "").replace("```", "").strip())
-                geo = geocode_address_native(intent.address, mapbox_secret)
+            with st.spinner("Resolving coordinates & pulling weather timeline from Open-Meteo..."):
+                geo = geocode_address_native(target_address, mapbox_secret)
                 
-                if "error" in geo: st.error(geo["error"])
+                if "error" in geo: 
+                    st.error(geo["error"])
                 else:
-                    weather = fetch_weather_native(geo["latitude"], geo["longitude"], intent.date)
-                    if "error" in weather or "hourly" not in weather: st.error("Could not pull valid weather timeline matrices.")
+                    date_str = target_date.strftime("%Y-%m-%d")
+                    weather = fetch_weather_native(geo["latitude"], geo["longitude"], date_str)
+                    
+                    if "error" in weather or "hourly" not in weather: 
+                        st.error("Could not pull valid weather timeline matrices for this date/location.")
                     else:
                         hourly = weather["hourly"]
                         active_rows = []
                         for i in range(len(hourly["time"])):
                             hr_int = int(hourly["time"][i].split("T")[1].split(":")[0])
-                            if intent.start_hour_24h <= hr_int <= intent.end_hour_24h:
+                            if start_hour <= hr_int <= end_hour:
                                 ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
                                 active_rows.append({
-                                    "date_string_final": datetime.strptime(intent.date, "%Y-%m-%d").strftime("%m/%d/%Y"), 
+                                    "date_string_final": target_date.strftime("%m/%d/%Y"), 
                                     "time_display": ampm, "hour_24h": hr_int,
                                     "latitude": geo["latitude"], "longitude": geo["longitude"], "longitude_absolute": abs(geo["longitude"]), 
                                     "tz_value": get_osha_tz_value(geo["longitude"]),
@@ -441,7 +417,8 @@ if st.session_state.step == 1:
                                     "wind_speed_mph": hourly["wind_speed_10m"][i], "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
                                 })
                         
-                        if not active_rows: st.error("No hours matched your operational shift boundaries.")
+                        if not active_rows: 
+                            st.error("No hours matched your operational shift boundaries.")
                         else:
                             st.session_state.final_hourly_rows = active_rows
                             st.session_state.worker_weight = worker_weight
@@ -452,7 +429,6 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
-    # CLINICAL TOGGLES & BIOMETRICS
     use_clinical = st.toggle("Advanced Clinical / Custom Workload", value=False)
     
     account_for_weight = True
@@ -480,7 +456,6 @@ elif st.session_state.step == 2:
     
     st.divider()
     
-    # HOURLY INPUTS
     preset_map = {"Light (180W)": 180, "Moderate (300W)": 300, "Heavy (415W)": 415, "Very Heavy (520W)": 520}
     selections = {}
     cols = st.columns(min(len(st.session_state.final_hourly_rows), 4))
@@ -496,7 +471,7 @@ elif st.session_state.step == 2:
     st.divider()
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("← Modify Location or Prompt Parameters"):
+        if st.button("← Modify Location or Timeline"):
             st.session_state.step = 1
             st.rerun()
     with c2:
@@ -505,20 +480,17 @@ elif st.session_state.step == 2:
                 if not use_clinical:
                     chosen_w = preset_map[selections[row["hour_24h"]]]
                     row["workload_label"] = selections[row["hour_24h"]].split(" ")[0]
-                    # Standard regulatory scaling against standard 154 lb reference man
                     row["final_watts"] = round((chosen_w * st.session_state.worker_weight) / 154.0, 1)
                 else:
                     met_val = selections[row["hour_24h"]]
                     worker_kg = st.session_state.worker_weight * 0.453592
                     
                     if not account_for_weight:
-                        # Baseline 70kg clinical reference
                         calc_watts = met_val * 70.0 * 1.163
                     else:
                         if clinical_method == "Standard Ainsworth (Weight Only)":
                             calc_watts = met_val * worker_kg * 1.163
                         else:
-                            # Clinical Mifflin-St Jeor
                             height_cm = height_in * 2.54
                             if sex == "Male": rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) + 5
                             else: rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) - 161
@@ -540,8 +512,10 @@ elif st.session_state.step == 2:
 elif st.session_state.step == 3:
     st.subheader("Step 3: Compliance Engineering Summary Analysis Output")
     
-    if st.session_state.fallback_active: st.warning("⚠️ **Playwright Fallback Active**: The system successfully estimated WBGT offline utilizing Stull's equation.")
-    else: st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
+    if st.session_state.fallback_active: 
+        st.warning("⚠️ **Playwright Fallback Active**: The system successfully estimated WBGT offline utilizing Stull's equation.")
+    else: 
+        st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
         
     fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight)
     st.pyplot(fig)
