@@ -394,7 +394,11 @@ def generate_compliance_plot(results, worker_weight, is_forecast):
 # =====================================================================
 # UI / STREAMLIT APP ENGINE
 # =====================================================================
-st.session_state.is_forecast = st.toggle("📅 Switch to Future Forecast Mode (For Planning & Prediction)", value=st.session_state.is_forecast)
+st.session_state.is_forecast = st.toggle(
+    "📅 Switch to Future Forecast Mode (For Planning & Prediction)", 
+    value=st.session_state.is_forecast,
+    disabled=(st.session_state.step > 1)
+)
 
 if st.session_state.is_forecast:
     st.title("🌤️ OSHA-WBGT Predictive Forecast Calculator")
