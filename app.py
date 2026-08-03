@@ -42,6 +42,8 @@ if "worker_weight" not in st.session_state:
     st.session_state.worker_weight = 154.0
 if "fallback_active" not in st.session_state:
     st.session_state.fallback_active = False
+if "location_fallback" not in st.session_state:
+    st.session_state.location_fallback = False
 
 # =====================================================================
 # GEOCODING & METEOROLOGICAL UTILITIES
@@ -93,9 +95,35 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
                 coords = features[0]["center"]
                 return {"latitude": coords[1], "longitude": coords[0]}
         
-        return {"error": "Location coordinates could not be resolved. Please simplify the address."}
+        return {"error": "Location coordinates could not be resolved."}
     except Exception as e:
         return {"error": f"Mapbox Fallback System Error: {str(e)}"}
+
+def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
+    street = street.strip()
+    city = city.strip()
+    state = state.strip()
+    zip_code = zip_code.strip()
+    
+    exact_parts = [p for p in [street, city, state, zip_code] if p]
+    exact_address = ", ".join(exact_parts)
+    
+    general_parts = [p for p in [city, state, zip_code] if p]
+    general_address = ", ".join(general_parts)
+    
+    # Attempt 1: Exact Address
+    if street:
+        res1 = geocode_address_native(exact_address, mapbox_key)
+        if "error" not in res1:
+            return res1, False 
+            
+    # Attempt 2: General Fallback (if exact failed or street wasn't provided)
+    if general_address:
+        res2 = geocode_address_native(general_address, mapbox_key)
+        if "error" not in res2:
+            return res2, True 
+            
+    return {"error": "Location coordinates could not be resolved. Please verify City, State, and Zip Code."}, False
 
 def fetch_weather_native(lat: float, lon: float, date_str: str) -> dict:
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -137,7 +165,6 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
 # =====================================================================
 def run_browser_automation(hourly_data, use_headed=False):
     computed_results = []
-    
     progress_bar = st.progress(0)
     status_text = st.empty()
     st.session_state.fallback_active = False
@@ -185,6 +212,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                 elif orig_temp > 120.0: notes_list.append("Air Temp rounded down to 120.0 °F")
                 if orig_rh < 1: notes_list.append("RH rounded up to 1%")
                 elif orig_rh > 100: notes_list.append("RH rounded down to 100%")
+                if st.session_state.location_fallback: notes_list.append("City/State/Zip were used as exact location could not be resolved")
                 
                 notes_str = " | ".join(notes_list) if notes_list else "None"
                 
@@ -239,7 +267,6 @@ def run_browser_automation(hourly_data, use_headed=False):
                 if sun_f > tlv_f or shade_f > tlv_f: status = "BREACH: TLV"
                 elif sun_f > al_f or shade_f > al_f: status = "WARNING: AL"
                 
-                # Prioritized dictionary output order
                 computed_results.append({
                     "Date": hour["date_string_final"],
                     "Time": hour["time_display"], 
@@ -271,6 +298,11 @@ def run_browser_automation(hourly_data, use_headed=False):
             sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=True)
             shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
             
+            notes_list = []
+            if st.session_state.location_fallback: notes_list.append("City/State/Zip were used as exact location could not be resolved")
+            notes_list.append("Offline Stull Fallback Used")
+            notes_str = " | ".join(notes_list)
+            
             adjusted_watts = hour["final_watts"]
             tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
             al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
@@ -298,7 +330,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                 "ACGIH_AL_F": al_f, 
                 "Safety_Status": status,
                 "Weather_Data_Source": "Open-Meteo Archive",
-                "Notes": "Offline Stull Fallback Used"
+                "Notes": notes_str
             })
 
     progress_bar.progress(1.0)
@@ -378,24 +410,34 @@ mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY"
 if st.session_state.step == 1:
     st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        target_address = st.text_input("Inspection / Worksite Location", value="Dallas, TX", help="Enter a street address, city, state, or ZIP code.")
-        target_date = st.date_input("Inspection Date", value=date(2025, 8, 12))
-    with col2:
-        start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
-        worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
+    st.markdown("**Location Details**")
+    c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
+    with c_addr1: target_street = st.text_input("Street Address (Optional)", help="e.g., 501 Aldon Rd")
+    with c_addr2: target_city = st.text_input("City", value="Dallas")
+    with c_addr3: target_state = st.text_input("State", value="TX")
+    with c_addr4: target_zip = st.text_input("ZIP Code", value="")
+    
+    st.markdown("**Shift & Employee Details**")
+    c_shift1, c_shift2, c_shift3 = st.columns([1.5, 2, 1.5])
+    with c_shift1: target_date = st.date_input("Inspection Date", value=date(2025, 8, 12))
+    with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
+    with c_shift3: worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
     if st.button("Fetch Historical Weather Data", type="primary"):
-        if not target_address.strip():
-            st.warning("Please supply a valid location or address.")
+        if not target_city.strip() and not target_zip.strip():
+            st.warning("Please supply at least a City/State or ZIP Code.")
         else:
             with st.spinner("Resolving coordinates & pulling weather timeline from Open-Meteo..."):
-                geo = geocode_address_native(target_address, mapbox_secret)
+                geo, fallback_used = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
                 
                 if "error" in geo: 
                     st.error(geo["error"])
                 else:
+                    if fallback_used and target_street.strip():
+                        st.warning("Exact street address could not be resolved. Defaulting to general City/State/Zip coordinates.")
+                        
+                    st.session_state.location_fallback = fallback_used and bool(target_street.strip())
+                    
                     date_str = target_date.strftime("%Y-%m-%d")
                     weather = fetch_weather_native(geo["latitude"], geo["longitude"], date_str)
                     
@@ -535,4 +577,5 @@ elif st.session_state.step == 3:
         st.session_state.step = 1
         st.session_state.final_hourly_rows = None
         st.session_state.fallback_active = False
+        st.session_state.location_fallback = False
         st.rerun()
