@@ -23,7 +23,7 @@ import csv
 import io
 import requests
 import urllib.parse
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from playwright.sync_api import sync_playwright
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -44,6 +44,8 @@ if "fallback_active" not in st.session_state:
     st.session_state.fallback_active = False
 if "location_fallback" not in st.session_state:
     st.session_state.location_fallback = False
+if "is_forecast" not in st.session_state:
+    st.session_state.is_forecast = False
 
 # =====================================================================
 # GEOCODING & METEOROLOGICAL UTILITIES
@@ -111,13 +113,11 @@ def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_k
     general_parts = [p for p in [city, state, zip_code] if p]
     general_address = ", ".join(general_parts)
     
-    # Attempt 1: Exact Address
     if street:
         res1 = geocode_address_native(exact_address, mapbox_key)
         if "error" not in res1:
             return res1, False 
             
-    # Attempt 2: General Fallback (if exact failed or street wasn't provided)
     if general_address:
         res2 = geocode_address_native(general_address, mapbox_key)
         if "error" not in res2:
@@ -125,8 +125,8 @@ def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_k
             
     return {"error": "Location coordinates could not be resolved. Please verify City, State, and Zip Code."}, False
 
-def fetch_weather_native(lat: float, lon: float, date_str: str) -> dict:
-    url = "https://archive-api.open-meteo.com/v1/archive"
+def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: bool) -> dict:
+    url = "https://api.open-meteo.com/v1/forecast" if is_forecast else "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
         "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
@@ -163,21 +163,16 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
 # =====================================================================
 # WEB AUTOMATION BACKEND ENGINE
 # =====================================================================
-def run_browser_automation(hourly_data, use_headed=False):
+def run_browser_automation(hourly_data, data_source_label):
     computed_results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     st.session_state.fallback_active = False
-    
-    actual_headless = not use_headed
-    if use_headed and not os.environ.get("DISPLAY"):
-        st.warning("⚠️ **Headed Mode Display Warning**: No desktop display environment detected. Running headlessly.")
-        actual_headless = True
         
     try:
         with sync_playwright() as p:
-            status_text.text("Launching browser context...")
-            browser = p.chromium.launch(headless=actual_headless, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"])
+            status_text.text("Launching headless browser context...")
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"])
             context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             page = context.new_page()
             
@@ -283,7 +278,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                     "ACGIH_TLV_F": tlv_f, 
                     "ACGIH_AL_F": al_f, 
                     "Safety_Status": status,
-                    "Weather_Data_Source": "Open-Meteo Archive",
+                    "Weather_Data_Source": data_source_label,
                     "Notes": notes_str
                 })
                 
@@ -329,7 +324,7 @@ def run_browser_automation(hourly_data, use_headed=False):
                 "ACGIH_TLV_F": tlv_f, 
                 "ACGIH_AL_F": al_f, 
                 "Safety_Status": status,
-                "Weather_Data_Source": "Open-Meteo Archive",
+                "Weather_Data_Source": data_source_label,
                 "Notes": notes_str
             })
 
@@ -340,7 +335,7 @@ def run_browser_automation(hourly_data, use_headed=False):
 # =====================================================================
 # MATPLOTLIB GRAPHICS COMPLIANCE GENERATOR
 # =====================================================================
-def generate_compliance_plot(results, worker_weight):
+def generate_compliance_plot(results, worker_weight, is_forecast):
     watts_range = np.linspace(90, 610, 500)
     tlv_curve_f = [(56.7 - (11.5 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     al_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
@@ -381,7 +376,8 @@ def generate_compliance_plot(results, worker_weight):
         ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
         ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
 
-    ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=12, fontweight='bold')
+    title_prefix = "Predictive" if is_forecast else "Historical"
+    ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot ({title_prefix})\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=12, fontweight='bold')
     ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
     ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
     
@@ -398,12 +394,17 @@ def generate_compliance_plot(results, worker_weight):
 # =====================================================================
 # UI / STREAMLIT APP ENGINE
 # =====================================================================
-st.title("☀️ OSHA-WBGT Localized Calculator")
+st.session_state.is_forecast = st.toggle("📅 Switch to Future Forecast Mode (For Planning & Prediction)", value=st.session_state.is_forecast)
+
+if st.session_state.is_forecast:
+    st.title("🌤️ OSHA-WBGT Predictive Forecast Calculator")
+    st.warning("**LEGAL DISCLAIMER & WARNING:** This tool is currently utilizing *forecasted* meteorological models for future planning. Weather conditions are inherently dynamic and can shift rapidly. These predictions may not perfectly reflect actual micro-climate conditions on site. Employers must not rely solely on this forecast; on-site environmental monitoring and situational awareness remain mandatory to ensure worker safety and compliance. This output is for preliminary hazard planning purposes only.")
+else:
+    st.title("☀️ OSHA-WBGT Localized Calculator")
+
 st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
 st.divider()
 
-st.sidebar.subheader("System Configurations")
-use_headed = st.sidebar.checkbox("Open Visible Browser Mode (Headed)", value=False)
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
 
 # --- WIZARD STEP 1: UI-BASED TARGET PARAMETER INPUTS ---
@@ -419,11 +420,20 @@ if st.session_state.step == 1:
     
     st.markdown("**Shift & Employee Details**")
     c_shift1, c_shift2, c_shift3 = st.columns([1.5, 2, 1.5])
-    with c_shift1: target_date = st.date_input("Inspection Date", value=date(2025, 8, 12))
+    
+    today_date = date.today()
+    with c_shift1: 
+        if st.session_state.is_forecast:
+            target_date = st.date_input("Planned Work Date", value=today_date, min_value=today_date, max_value=today_date + timedelta(days=14))
+        else:
+            target_date = st.date_input("Inspection Date", value=today_date - timedelta(days=1), max_value=today_date)
+            
     with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
     with c_shift3: worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
-    if st.button("Fetch Historical Weather Data", type="primary"):
+    button_text = "Fetch Forecasted Weather Data" if st.session_state.is_forecast else "Fetch Historical Weather Data"
+    
+    if st.button(button_text, type="primary"):
         if not target_city.strip() and not target_zip.strip():
             st.warning("Please supply at least a City/State or ZIP Code.")
         else:
@@ -439,7 +449,7 @@ if st.session_state.step == 1:
                     st.session_state.location_fallback = fallback_used and bool(target_street.strip())
                     
                     date_str = target_date.strftime("%Y-%m-%d")
-                    weather = fetch_weather_native(geo["latitude"], geo["longitude"], date_str)
+                    weather = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
                     
                     if "error" in weather or "hourly" not in weather: 
                         st.error("Could not pull valid weather timeline matrices for this date/location.")
@@ -543,7 +553,8 @@ elif st.session_state.step == 2:
                     row["final_watts"] = round(calc_watts, 1)
                 
             with st.spinner("Executing calculations..."):
-                results = run_browser_automation(st.session_state.final_hourly_rows, use_headed=use_headed)
+                data_source_label = "Open-Meteo Forecast (Predicted)" if st.session_state.is_forecast else "Open-Meteo Archive (Historical)"
+                results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label)
                 
             if results:
                 st.session_state.results = results
@@ -559,7 +570,7 @@ elif st.session_state.step == 3:
     else: 
         st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
         
-    fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight)
+    fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight, st.session_state.is_forecast)
     st.pyplot(fig)
     
     st.subheader("Raw Exposure Tracking Metrics Matrix")
