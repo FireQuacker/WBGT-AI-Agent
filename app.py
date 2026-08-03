@@ -46,6 +46,12 @@ if "location_fallback" not in st.session_state:
     st.session_state.location_fallback = False
 if "is_forecast" not in st.session_state:
     st.session_state.is_forecast = False
+if "use_caf" not in st.session_state:
+    st.session_state.use_caf = False
+if "caf_value" not in st.session_state:
+    st.session_state.caf_value = 0.0
+if "caf_label" not in st.session_state:
+    st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
 
 # =====================================================================
 # GEOCODING & METEOROLOGICAL UTILITIES
@@ -208,6 +214,7 @@ def run_browser_automation(hourly_data, data_source_label):
                 if orig_rh < 1: notes_list.append("RH rounded up to 1%")
                 elif orig_rh > 100: notes_list.append("RH rounded down to 100%")
                 if st.session_state.location_fallback: notes_list.append("City/State/Zip were used as exact location could not be resolved")
+                if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
                 
                 notes_str = " | ".join(notes_list) if notes_list else "None"
                 
@@ -250,6 +257,11 @@ def run_browser_automation(hourly_data, data_source_label):
                     sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=True)
                     shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
                     notes_str = "Offline Stull Fallback Used" if notes_str == "None" else notes_str + " | Offline Stull Fallback Used"
+                
+                # Apply Clothing Adjustment Factor (CAF) if enabled
+                if st.session_state.use_caf:
+                    sun_f = round(sun_f + st.session_state.caf_value, 1)
+                    shade_f = round(shade_f + st.session_state.caf_value, 1)
                     
                 adjusted_watts = hour["final_watts"]
                 tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
@@ -293,8 +305,13 @@ def run_browser_automation(hourly_data, data_source_label):
             sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=True)
             shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
             
+            if st.session_state.use_caf:
+                sun_f = round(sun_f + st.session_state.caf_value, 1)
+                shade_f = round(shade_f + st.session_state.caf_value, 1)
+            
             notes_list = []
             if st.session_state.location_fallback: notes_list.append("City/State/Zip were used as exact location could not be resolved")
+            if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
             notes_list.append("Offline Stull Fallback Used")
             notes_str = " | ".join(notes_list)
             
@@ -335,7 +352,7 @@ def run_browser_automation(hourly_data, data_source_label):
 # =====================================================================
 # MATPLOTLIB GRAPHICS COMPLIANCE GENERATOR
 # =====================================================================
-def generate_compliance_plot(results, worker_weight, is_forecast):
+def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_label):
     watts_range = np.linspace(90, 610, 500)
     tlv_curve_f = [(56.7 - (11.5 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     al_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
@@ -369,15 +386,25 @@ def generate_compliance_plot(results, worker_weight, is_forecast):
                                  label='Shift Exposure Envelope Box')
         ax.add_patch(rect)
     
-    ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
-    ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
-    
-    for i, r in enumerate(results):
-        ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
-        ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
+    # If CAF is active, plot only CAF-adjusted markers with clean labels to avoid clutter
+    if use_caf:
+        ax.scatter(x_watts, y_sun, color='darkred', marker='d', s=130, zorder=5, label='Effective Sun WBGT (CAF-Adjusted)')
+        ax.scatter(x_watts, y_shade, color='darkblue', marker='p', s=120, zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
+        
+        for i, r in enumerate(results):
+            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
+            ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
+    else:
+        ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
+        ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
+        
+        for i, r in enumerate(results):
+            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
+            ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
 
     title_prefix = "Predictive" if is_forecast else "Historical"
-    ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot ({title_prefix})\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=12, fontweight='bold')
+    caf_subtitle = f"\nClothing Adjustment Factor (CAF): {caf_label}" if use_caf else ""
+    ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot ({title_prefix}){caf_subtitle}\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=11, fontweight='bold')
     ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
     ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
     
@@ -485,6 +512,31 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
+    # --- CLOTHING ADJUSTMENT FACTOR (CAF) CONFIGURATION ---
+    st.markdown("### Clothing & PPE Adjustment Factor (Optional)")
+    use_caf = st.toggle("Apply ACGIH Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
+    caf_value = 0.0
+    caf_label = "Standard Work Clothes (0.0 °F)"
+    
+    if use_caf:
+        caf_dict = {
+            "Short sleeves and pants (-1.8 °F)": -1.8,
+            "Work clothes / Cloth coveralls (0.0 °F)": 0.0,
+            "SMS polypropylene coveralls (+0.9 °F)": 0.9,
+            "Polyolefin coveralls (+1.8 °F)": 1.8,
+            "Double-layer woven clothing (+5.4 °F)": 5.4,
+            "Limited-use vapor-barrier coveralls (+19.8 °F)": 19.8
+        }
+        caf_choice = st.selectbox("Select Clothing Ensemble / PPE Type", list(caf_dict.keys()))
+        caf_value = caf_dict[caf_choice]
+        caf_label = caf_choice
+        st.info(f"ℹ️ Active CAF Correction: **{caf_value:+.1f} °F** will be added to the calculated WBGT values.")
+        
+    st.session_state.use_caf = use_caf
+    st.session_state.caf_value = caf_value
+    st.session_state.caf_label = caf_label
+    
+    st.divider()
     use_clinical = st.toggle("Advanced Clinical / Custom Workload", value=False)
     
     account_for_weight = True
@@ -574,7 +626,13 @@ elif st.session_state.step == 3:
     else: 
         st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
         
-    fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight, st.session_state.is_forecast)
+    fig = generate_compliance_plot(
+        st.session_state.results, 
+        st.session_state.worker_weight, 
+        st.session_state.is_forecast, 
+        st.session_state.use_caf, 
+        st.session_state.caf_label
+    )
     st.pyplot(fig)
     
     st.subheader("Raw Exposure Tracking Metrics Matrix")
@@ -593,4 +651,6 @@ elif st.session_state.step == 3:
         st.session_state.final_hourly_rows = None
         st.session_state.fallback_active = False
         st.session_state.location_fallback = False
+        st.session_state.use_caf = False
+        st.session_state.caf_value = 0.0
         st.rerun()
