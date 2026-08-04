@@ -636,7 +636,11 @@ elif st.session_state.step == 2:
                     row["final_watts"] = round(calc_watts, 1)
                 
             with st.spinner("Executing calculations..."):
-                data_source_label = "Open-Meteo Forecast (Predicted)" if st.session_state.is_forecast else "Open-Meteo Archive (Historical)"
+                data_source_label = (
+                    "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
+                    if st.session_state.is_forecast 
+                    else "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
+                )
                 results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
                 
             if results:
