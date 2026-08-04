@@ -52,6 +52,8 @@ if "caf_value" not in st.session_state:
     st.session_state.caf_value = 0.0
 if "caf_label" not in st.session_state:
     st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
+if "standard_choice" not in st.session_state:
+    st.session_state.standard_choice = "NIOSH (Default)"
 
 # =====================================================================
 # GEOCODING & METEOROLOGICAL UTILITIES
@@ -169,11 +171,17 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
 # =====================================================================
 # WEB AUTOMATION BACKEND ENGINE
 # =====================================================================
-def run_browser_automation(hourly_data, data_source_label):
+def run_browser_automation(hourly_data, data_source_label, standard_choice):
     computed_results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     st.session_state.fallback_active = False
+    
+    is_acgih = "ACGIH" in standard_choice
+    limit_key = "ACGIH_TLV_F" if is_acgih else "NIOSH_REL_F"
+    alert_key = "ACGIH_AL_F" if is_acgih else "NIOSH_RAL_F"
+    limit_name = "TLV" if is_acgih else "REL"
+    alert_name = "AL" if is_acgih else "RAL"
         
     try:
         with sync_playwright() as p:
@@ -258,23 +266,22 @@ def run_browser_automation(hourly_data, data_source_label):
                     shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
                     notes_str = "Offline Stull Fallback Used" if notes_str == "None" else notes_str + " | Offline Stull Fallback Used"
                 
-                # Apply Clothing Adjustment Factor (CAF) if enabled
                 if st.session_state.use_caf:
                     sun_f = round(sun_f + st.session_state.caf_value, 1)
                     shade_f = round(shade_f + st.session_state.caf_value, 1)
                     
                 adjusted_watts = hour["final_watts"]
-                tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
-                al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
+                limit_c = 56.7 - (11.5 * math.log10(adjusted_watts))
+                alert_c = 59.9 - (14.1 * math.log10(adjusted_watts))
                 
-                tlv_f = round((tlv_c * 1.8) + 32, 1)
-                al_f = round((al_c * 1.8) + 32, 1)
+                limit_f = round((limit_c * 1.8) + 32, 1)
+                alert_f = round((alert_c * 1.8) + 32, 1)
                 
                 status = "Normal"
-                if sun_f > tlv_f or shade_f > tlv_f: status = "BREACH: TLV"
-                elif sun_f > al_f or shade_f > al_f: status = "WARNING: AL"
+                if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
+                elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
                 
-                computed_results.append({
+                row_dict = {
                     "Date": hour["date_string_final"],
                     "Time": hour["time_display"], 
                     "Latitude": hour["latitude"],
@@ -286,13 +293,15 @@ def run_browser_automation(hourly_data, data_source_label):
                     "Sun_WBGT_F": sun_f, 
                     "Shade_WBGT_F": shade_f, 
                     "Workload": hour["workload_label"], 
-                    "Adjusted_Watts": adjusted_watts, 
-                    "ACGIH_TLV_F": tlv_f, 
-                    "ACGIH_AL_F": al_f, 
-                    "Safety_Status": status,
-                    "Weather_Data_Source": data_source_label,
-                    "Notes": notes_str
-                })
+                    "Adjusted_Watts": adjusted_watts
+                }
+                row_dict[limit_key] = limit_f
+                row_dict[alert_key] = alert_f
+                row_dict["Safety_Status"] = status
+                row_dict["Weather_Data_Source"] = data_source_label
+                row_dict["Notes"] = notes_str
+                
+                computed_results.append(row_dict)
                 
             browser.close()
             
@@ -316,16 +325,16 @@ def run_browser_automation(hourly_data, data_source_label):
             notes_str = " | ".join(notes_list)
             
             adjusted_watts = hour["final_watts"]
-            tlv_c = 56.7 - (11.5 * math.log10(adjusted_watts))
-            al_c = 59.9 - (14.1 * math.log10(adjusted_watts))
-            tlv_f = round((tlv_c * 1.8) + 32, 1)
-            al_f = round((al_c * 1.8) + 32, 1)
+            limit_c = 56.7 - (11.5 * math.log10(adjusted_watts))
+            alert_c = 59.9 - (14.1 * math.log10(adjusted_watts))
+            limit_f = round((limit_c * 1.8) + 32, 1)
+            alert_f = round((alert_c * 1.8) + 32, 1)
             
             status = "Normal"
-            if sun_f > tlv_f or shade_f > tlv_f: status = "BREACH: TLV"
-            elif sun_f > al_f or shade_f > al_f: status = "WARNING: AL"
+            if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
+            elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
             
-            computed_results.append({
+            row_dict = {
                 "Date": hour["date_string_final"],
                 "Time": hour["time_display"], 
                 "Latitude": hour["latitude"],
@@ -337,13 +346,15 @@ def run_browser_automation(hourly_data, data_source_label):
                 "Sun_WBGT_F": sun_f, 
                 "Shade_WBGT_F": shade_f, 
                 "Workload": hour["workload_label"], 
-                "Adjusted_Watts": adjusted_watts, 
-                "ACGIH_TLV_F": tlv_f, 
-                "ACGIH_AL_F": al_f, 
-                "Safety_Status": status,
-                "Weather_Data_Source": data_source_label,
-                "Notes": notes_str
-            })
+                "Adjusted_Watts": adjusted_watts
+            }
+            row_dict[limit_key] = limit_f
+            row_dict[alert_key] = alert_f
+            row_dict["Safety_Status"] = status
+            row_dict["Weather_Data_Source"] = data_source_label
+            row_dict["Notes"] = notes_str
+            
+            computed_results.append(row_dict)
 
     progress_bar.progress(1.0)
     status_text.text("Processing operation completed successfully.")
@@ -352,10 +363,15 @@ def run_browser_automation(hourly_data, data_source_label):
 # =====================================================================
 # MATPLOTLIB GRAPHICS COMPLIANCE GENERATOR
 # =====================================================================
-def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_label):
+def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_label, standard_choice):
+    is_acgih = "ACGIH" in standard_choice
+    limit_label = 'ACGIH TLV (Acclimatized Limit)' if is_acgih else 'NIOSH REL (Acclimatized Limit)'
+    alert_label = 'ACGIH Action Limit (Unacclimatized)' if is_acgih else 'NIOSH RAL (Unacclimatized Alert)'
+    standard_prefix = "ACGIH" if is_acgih else "NIOSH"
+
     watts_range = np.linspace(90, 610, 500)
-    tlv_curve_f = [(56.7 - (11.5 * math.log10(w))) * 1.8 + 32 for w in watts_range]
-    al_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
+    limit_curve_f = [(56.7 - (11.5 * math.log10(w))) * 1.8 + 32 for w in watts_range]
+    alert_curve_f = [(59.9 - (14.1 * math.log10(w))) * 1.8 + 32 for w in watts_range]
     
     fig, ax = plt.subplots(figsize=(11, 6.5))
     
@@ -364,8 +380,8 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
         ax.axvline(x=w_val, color='grey', linestyle=':', alpha=0.4)
         ax.text(w_val + 4, 66, label, rotation=90, color='grey', alpha=0.6, fontsize=9, va='bottom')
     
-    ax.plot(watts_range, tlv_curve_f, color='crimson', linestyle='-', linewidth=2.5, label='ACGIH TLV (Acclimatized Limit)')
-    ax.plot(watts_range, al_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label='ACGIH Action Limit (Unacclimatized)')
+    ax.plot(watts_range, limit_curve_f, color='crimson', linestyle='-', linewidth=2.5, label=limit_label)
+    ax.plot(watts_range, alert_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label=alert_label)
     
     x_watts = [r["Adjusted_Watts"] for r in results]
     y_sun = [r["Sun_WBGT_F"] for r in results]
@@ -386,7 +402,6 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
                                  label='Shift Exposure Envelope Box')
         ax.add_patch(rect)
     
-    # If CAF is active, plot only CAF-adjusted markers with clean labels to avoid clutter
     if use_caf:
         ax.scatter(x_watts, y_sun, color='darkred', marker='d', s=130, zorder=5, label='Effective Sun WBGT (CAF-Adjusted)')
         ax.scatter(x_watts, y_shade, color='darkblue', marker='p', s=120, zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
@@ -404,7 +419,7 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
 
     title_prefix = "Predictive" if is_forecast else "Historical"
     caf_subtitle = f"\nClothing Adjustment Factor (CAF): {caf_label}" if use_caf else ""
-    ax.set_title(f"ACGIH Heat Stress Analytical Assessment Plot ({title_prefix}){caf_subtitle}\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=11, fontweight='bold')
+    ax.set_title(f"{standard_prefix} Heat Stress Analytical Assessment Plot ({title_prefix}){caf_subtitle}\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=11, fontweight='bold')
     ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
     ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
     
@@ -512,9 +527,21 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
+    # --- HEAT STRESS STANDARD SELECTION ---
+    st.markdown("### Heat Stress Standard")
+    standard_choice = st.radio(
+        "Select Evaluation Standard", 
+        ["NIOSH (Default)", "ACGIH (Requires Permission)"],
+        help="NIOSH values are public domain. ACGIH values are copyrighted intellectual property."
+    )
+    st.session_state.standard_choice = standard_choice
+    
+    if "ACGIH" in standard_choice:
+        st.warning("**LEGAL DISCLAIMER:** TLVs® and BEIs® are copyrighted property of the American Conference of Governmental Industrial Hygienists (ACGIH®). This application is not endorsed by, sponsored by, or affiliated with ACGIH. This toggle is included for internal testing and pending formal permission.")
+    
     # --- CLOTHING ADJUSTMENT FACTOR (CAF) CONFIGURATION ---
     st.markdown("### Clothing & PPE Adjustment Factor (Optional)")
-    use_caf = st.toggle("Apply ACGIH Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
+    use_caf = st.toggle("Apply Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
     caf_value = 0.0
     caf_label = "Standard Work Clothes (0.0 °F)"
     
@@ -610,7 +637,7 @@ elif st.session_state.step == 2:
                 
             with st.spinner("Executing calculations..."):
                 data_source_label = "Open-Meteo Forecast (Predicted)" if st.session_state.is_forecast else "Open-Meteo Archive (Historical)"
-                results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label)
+                results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
                 
             if results:
                 st.session_state.results = results
@@ -631,7 +658,8 @@ elif st.session_state.step == 3:
         st.session_state.worker_weight, 
         st.session_state.is_forecast, 
         st.session_state.use_caf, 
-        st.session_state.caf_label
+        st.session_state.caf_label,
+        st.session_state.standard_choice
     )
     st.pyplot(fig)
     
