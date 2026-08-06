@@ -36,6 +36,8 @@ st.set_page_config(page_title="OSHA-WBGT Localized Calculator", layout="wide")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
+if "pending_geo" not in st.session_state:
+    st.session_state.pending_geo = None
 if "final_hourly_rows" not in st.session_state:
     st.session_state.final_hourly_rows = None
 if "worker_weight" not in st.session_state:
@@ -170,7 +172,6 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12
     
     if is_sun:
         wind_ms = max(wind_mph * 0.44704, 0.1)
-        # Diurnal solar radiation scaling curve (peaks around 12:00-13:00, zero at night)
         if 6 <= hour_24h <= 18:
             solar_rad = 850.0 * math.sin(math.pi * (hour_24h - 6) / 12.0)
         else:
@@ -461,6 +462,88 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
     return fig
 
 # =====================================================================
+# LOCATION CONFIRMATION POP-UP DIALOG
+# =====================================================================
+@st.dialog("Confirm Target Location")
+def show_location_confirmation_dialog():
+    geo = st.session_state.pending_geo
+    st.write("Please confirm that the retrieved location matches your intended site before proceeding:")
+    
+    col_entered, col_matched = st.columns(2)
+    with col_entered:
+        st.markdown("**User Entered Location:**")
+        st.info(geo["raw_entered"])
+    with col_matched:
+        st.markdown("**Retrieved / Geocoded Site:**")
+        st.success(geo["matched_address"])
+        
+    st.caption(f"📍 **Coordinates:** Latitude {geo['latitude']}, Longitude {geo['longitude']}")
+    
+    if geo.get("fallback_used"):
+        st.warning("⚠️ Street address could not be specifically pinpointed. Geocoding fell back to City/State/ZIP center.")
+
+    col_confirm, col_edit = st.columns(2)
+    with col_confirm:
+        if st.button("Confirm & Proceed →", type="primary", use_container_width=True):
+            st.session_state.confirmed_geo = geo
+            st.session_state.pending_geo = None
+            
+            target_date = geo["target_date"]
+            start_hour, end_hour = geo["shift_hours"]
+            worker_weight = geo["worker_weight"]
+            
+            date_str = target_date.strftime("%Y-%m-%d")
+            weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
+            
+            if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]:
+                st.error("Could not pull valid weather timeline matrices for this date/location.")
+            else:
+                hourly = weather_res["hourly"]
+                grid_lat = weather_res["grid_latitude"]
+                grid_lon = weather_res["grid_longitude"]
+                dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
+                
+                st.session_state.location_meta = {
+                    "user_entered": geo["raw_entered"],
+                    "validated": geo["matched_address"],
+                    "target_lat": geo["latitude"],
+                    "target_lon": geo["longitude"],
+                    "grid_lat": grid_lat,
+                    "grid_lon": grid_lon,
+                    "distance_miles": dist_miles
+                }
+                
+                active_rows = []
+                for i in range(len(hourly["time"])):
+                    hr_int = int(hourly["time"][i].split("T")[1].split(":")[0])
+                    if start_hour <= hr_int <= end_hour:
+                        ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
+                        active_rows.append({
+                            "date_string_final": target_date.strftime("%m/%d/%Y"), 
+                            "time_display": ampm, "hour_24h": hr_int,
+                            "user_entered_address": geo["raw_entered"],
+                            "validated_address": geo["matched_address"],
+                            "latitude": geo["latitude"], "longitude": geo["longitude"],
+                            "grid_latitude": grid_lat, "grid_longitude": grid_lon,
+                            "grid_distance_miles": dist_miles,
+                            "longitude_absolute": abs(geo["longitude"]), 
+                            "tz_value": get_osha_tz_value(geo["longitude"]),
+                            "temperature_f": hourly["temperature_2m"][i], "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
+                            "wind_speed_mph": hourly["wind_speed_10m"][i], "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
+                        })
+                
+                st.session_state.final_hourly_rows = active_rows
+                st.session_state.worker_weight = worker_weight
+                st.session_state.location_fallback = geo.get("fallback_used", False)
+                st.session_state.step = 2
+                st.rerun()
+
+    with col_edit:
+        if st.button("Edit Location", type="secondary", use_container_width=True):
+            st.session_state.pending_geo = None
+            st.rerun()
+
+# =====================================================================
 # UI / STREAMLIT APP ENGINE
 # =====================================================================
 st.session_state.is_forecast = st.toggle(
@@ -480,17 +563,31 @@ st.divider()
 
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
 
+# Trigger confirmation modal if geocoding completed but needs verification
+if st.session_state.pending_geo is not None:
+    show_location_confirmation_dialog()
+
 # --- WIZARD STEP 1: UI-BASED TARGET PARAMETER INPUTS ---
 if st.session_state.step == 1:
     st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
-    st.markdown("**Location Details**")
-    c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
-    with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 501 Aldon Rd")
-    with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Dallas")
-    with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., TX")
-    with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 75201")
+    col_loc_header, col_loc_toggle = st.columns([3, 1])
+    with col_loc_header:
+        st.markdown("**Location Details**")
+    with col_loc_toggle:
+        use_gps = st.toggle("Use GPS Coordinates", value=False)
     
+    if not use_gps:
+        c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
+        with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 7339 State Road")
+        with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Philadelphia")
+        with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., PA")
+        with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 19136")
+    else:
+        c_gps1, c_gps2 = st.columns(2)
+        with c_gps1: target_lat_in = st.text_input("Latitude", value="", placeholder="e.g., 40.0345")
+        with c_gps2: target_lon_in = st.text_input("Longitude", value="", placeholder="e.g., -75.0181")
+
     st.markdown("**Shift & Employee Details**")
     c_shift1, c_shift2, c_shift3 = st.columns([1.5, 2, 1.5])
     
@@ -507,68 +604,44 @@ if st.session_state.step == 1:
     button_text = "Fetch Forecasted Weather Data" if st.session_state.is_forecast else "Fetch Historical Weather Data"
     
     if st.button(button_text, type="primary"):
-        if not target_city.strip() and not target_zip.strip():
-            st.warning("Please supply at least a City/State or ZIP Code.")
+        if use_gps:
+            try:
+                lat_val = float(target_lat_in)
+                lon_val = float(target_lon_in)
+                st.session_state.pending_geo = {
+                    "latitude": lat_val,
+                    "longitude": lon_val,
+                    "matched_address": f"Exact Coordinates ({lat_val}, {lon_val})",
+                    "raw_entered": f"GPS: {lat_val}, {lon_val}",
+                    "fallback_used": False,
+                    "target_date": target_date,
+                    "shift_hours": (start_hour, end_hour),
+                    "worker_weight": worker_weight
+                }
+                st.rerun()
+            except ValueError:
+                st.error("Please enter valid numerical values for Latitude and Longitude.")
         else:
-            with st.spinner("Resolving coordinates & pulling weather timeline from Open-Meteo..."):
-                geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
-                
-                if "error" in geo: 
-                    st.error(geo["error"])
-                else:
-                    if fallback_used and target_street.strip():
-                        st.warning("Exact street address could not be resolved. Defaulting to general City/State/ZIP coordinates.")
-                        
-                    st.session_state.location_fallback = fallback_used and bool(target_street.strip())
+            if not target_city.strip() and not target_zip.strip() and not target_street.strip():
+                st.warning("Please supply at least a City/State, ZIP Code, or Street Address.")
+            else:
+                with st.spinner("Resolving location coordinates..."):
+                    geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
                     
-                    date_str = target_date.strftime("%Y-%m-%d")
-                    weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
-                    
-                    if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]: 
-                        st.error("Could not pull valid weather timeline matrices for this date/location.")
+                    if "error" in geo:
+                        st.error(geo["error"])
                     else:
-                        hourly = weather_res["hourly"]
-                        grid_lat = weather_res["grid_latitude"]
-                        grid_lon = weather_res["grid_longitude"]
-                        
-                        dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
-                        
-                        st.session_state.location_meta = {
-                            "user_entered": raw_entered_address,
-                            "validated": geo.get("matched_address", raw_entered_address),
-                            "target_lat": geo["latitude"],
-                            "target_lon": geo["longitude"],
-                            "grid_lat": grid_lat,
-                            "grid_lon": grid_lon,
-                            "distance_miles": dist_miles
+                        st.session_state.pending_geo = {
+                            "latitude": geo["latitude"],
+                            "longitude": geo["longitude"],
+                            "matched_address": geo.get("matched_address", raw_entered_address),
+                            "raw_entered": raw_entered_address,
+                            "fallback_used": fallback_used and bool(target_street.strip()),
+                            "target_date": target_date,
+                            "shift_hours": (start_hour, end_hour),
+                            "worker_weight": worker_weight
                         }
-                        
-                        active_rows = []
-                        for i in range(len(hourly["time"])):
-                            hr_int = int(hourly["time"][i].split("T")[1].split(":")[0])
-                            if start_hour <= hr_int <= end_hour:
-                                ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
-                                active_rows.append({
-                                    "date_string_final": target_date.strftime("%m/%d/%Y"), 
-                                    "time_display": ampm, "hour_24h": hr_int,
-                                    "user_entered_address": raw_entered_address,
-                                    "validated_address": geo.get("matched_address", raw_entered_address),
-                                    "latitude": geo["latitude"], "longitude": geo["longitude"],
-                                    "grid_latitude": grid_lat, "grid_longitude": grid_lon,
-                                    "grid_distance_miles": dist_miles,
-                                    "longitude_absolute": abs(geo["longitude"]), 
-                                    "tz_value": get_osha_tz_value(geo["longitude"]),
-                                    "temperature_f": hourly["temperature_2m"][i], "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
-                                    "wind_speed_mph": hourly["wind_speed_10m"][i], "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
-                                })
-                        
-                        if not active_rows: 
-                            st.error("No hours matched your operational shift boundaries.")
-                        else:
-                            st.session_state.final_hourly_rows = active_rows
-                            st.session_state.worker_weight = worker_weight
-                            st.session_state.step = 2
-                            st.rerun()
+                        st.rerun()
 
 # --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
 elif st.session_state.step == 2:
@@ -708,8 +781,8 @@ elif st.session_state.step == 3:
     if meta:
         st.info(
             f"📍 **Address Audit Trail:**\n"
-            f"* **Entered Address:** {meta.get('user_entered', 'N/A')}\n"
-            f"* **Validated/Geocoded Address:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})\n"
+            f"* **Entered Location:** {meta.get('user_entered', 'N/A')}\n"
+            f"* **Validated/Geocoded Location:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})\n"
             f"* **Open-Meteo Grid Point:** Lat {meta.get('grid_lat')}, Lon {meta.get('grid_lon')}\n"
             f"* **Distance to Weather Data Grid Point:** **{meta.get('distance_miles', 0.0):.2f} miles**"
         )
@@ -737,6 +810,7 @@ elif st.session_state.step == 3:
     st.divider()
     if st.button("🔄 Execute Fresh Inspection Run"):
         st.session_state.step = 1
+        st.session_state.pending_geo = None
         st.session_state.final_hourly_rows = None
         st.session_state.fallback_active = False
         st.session_state.location_fallback = False
