@@ -549,6 +549,25 @@ else:
 st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
 st.divider()
 
+# --- METHODOLOGY & ABOUT EXPANDER ---
+with st.expander("📚 Methodology, Data Sources & About the Author"):
+    st.markdown("""
+    ### 📍 Address Matching & Geocoding Pipeline
+    This application utilizes a highly accurate, dual-geocoding approach to pinpoint workplace locations. Initial location requests are passed through the **US Census Bureau's native geocoding database** to provide exact street-level, regional, and municipal matching. If the primary Census database is unable to resolve an ambiguous or newly developed address, the system automatically engages a secondary fallback protocol utilizing the **Mapbox (OpenStreetMap) API** to ensure precise latitudinal and longitudinal coordinate extraction.
+    
+    ### 🌤️ Weather Data & Meteorological Modeling
+    After establishing accurate site coordinates, the application interfaces with the **Open-Meteo API** to pull localized weather matrices. 
+    
+    For historical compliance auditing, this tool depends heavily on the **ERA5 reanalysis model** (the fifth generation ECMWF atmospheric reanalysis of the global climate). ERA5 synthesizes massive arrays of historical meteorological observations—including decades of continuous **NOAA station data**, atmospheric balloon soundings, and satellite imagery—into a cohesive and seamless global grid. This provides an uninterrupted and deeply accurate historical climate record. 
+    
+    *Recent independent scientific evaluations, including [a comprehensive study published by NOAA and related atmospheric researchers](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2023JH000102), have demonstrated that ERA5 currently stands as the most accurate and reliable reanalysis model available for reconstructing historical ground-level weather data.*
+    
+    ### 👨‍🔬 About the Developer
+    **Andre Taylor** is a Health Scientist for the Occupational Safety and Health Administration (OSHA) and a leading Subject Matter Expert (SME) on workplace heat exposure, physiological hazard assessments, and industrial mitigation strategies. 
+    
+    Bringing over 20 years of foundational nursing experience to his role alongside a prominent background as a Compliance Safety and Health Officer (CSHO), Andre bridges the critical operational gap between clinical health sciences and practical, on-the-ground occupational safety. As an established process improvement specialist, data scientist, and AI developer, he is deeply dedicated to engineering modernized, high-efficiency regulatory tools that empower safety professionals to better protect worker health.
+    """)
+
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
 
 if st.session_state.pending_geo is not None:
