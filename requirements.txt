@@ -1,6 +1,8 @@
 streamlit
 playwright==1.49.0
-google-genai
 pydantic
 matplotlib
 numpy
+pandas
+requests
+openpyxl
