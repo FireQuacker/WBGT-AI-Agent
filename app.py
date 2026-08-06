@@ -19,7 +19,6 @@ install_browser_engine()
 # =====================================================================
 import time
 import math
-import csv
 import io
 import requests
 import urllib.parse
@@ -29,6 +28,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 import pandas as pd
+import openpyxl
+from openpyxl.drawing.image import Image as OpenPyxlImage
 
 # =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
@@ -300,15 +301,9 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
                 elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
                 
-                # Removed cluttered address fields here
                 row_dict = {
                     "Date": hour["date_string_final"],
                     "Time": hour["time_display"], 
-                    "Target_Latitude": hour["latitude"],
-                    "Target_Longitude": hour["longitude"],
-                    "Weather_Grid_Latitude": hour["grid_latitude"],
-                    "Weather_Grid_Longitude": hour["grid_longitude"],
-                    "Grid_Distance_Miles": hour["grid_distance_miles"],
                     "Air_Temp_F": orig_temp, 
                     "Humidity_Pct": orig_rh, 
                     "Wind_Speed_mph": orig_ws,
@@ -357,15 +352,9 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
             if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
             elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
             
-            # Removed cluttered address fields here
             row_dict = {
                 "Date": hour["date_string_final"],
                 "Time": hour["time_display"], 
-                "Target_Latitude": hour["latitude"],
-                "Target_Longitude": hour["longitude"],
-                "Weather_Grid_Latitude": hour["grid_latitude"],
-                "Weather_Grid_Longitude": hour["grid_longitude"],
-                "Grid_Distance_Miles": hour["grid_distance_miles"],
                 "Air_Temp_F": orig_temp, 
                 "Humidity_Pct": orig_rh, 
                 "Wind_Speed_mph": orig_ws,
@@ -562,7 +551,6 @@ st.divider()
 
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
 
-# Trigger confirmation modal if geocoding completed but needs verification
 if st.session_state.pending_geo is not None:
     show_location_confirmation_dialog()
 
@@ -646,7 +634,6 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
-    # --- HEAT STRESS STANDARD SELECTION ---
     st.markdown("### Heat Stress Standard")
     standard_choice = st.radio(
         "Select Evaluation Standard", 
@@ -658,7 +645,6 @@ elif st.session_state.step == 2:
     if "ACGIH" in standard_choice:
         st.warning("**LEGAL DISCLAIMER:** TLVs® and BEIs® are copyrighted property of the American Conference of Governmental Industrial Hygienists (ACGIH®). This application is not endorsed by, sponsored by, or affiliated with ACGIH. This toggle is included for internal testing and pending formal permission.")
     
-    # --- CLOTHING ADJUSTMENT FACTOR (CAF) CONFIGURATION ---
     st.markdown("### Clothing & PPE Adjustment Factor (Optional)")
     use_caf = st.toggle("Apply Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
     caf_value = 0.0
@@ -798,62 +784,61 @@ elif st.session_state.step == 3:
     
     st.subheader("Raw Exposure Tracking Metrics Matrix")
     
-    # Load into dataframe (address columns already removed in step 2 processing)
     df_results = pd.DataFrame(st.session_state.results)
     st.dataframe(df_results, use_container_width=True)
     
-    # Generate Date For Filename based on Exposure Matrix
+    # Parse date from metrics matrix for correct report filename labeling
     if st.session_state.results:
         raw_exposure_date = st.session_state.results[0]["Date"]
         file_date_str = datetime.strptime(raw_exposure_date, "%m/%d/%Y").strftime("%Y%m%d")
     else:
         file_date_str = datetime.now().strftime("%Y%m%d")
     
-    # Generate Download File Payload (Excel Tabbed File w/ CSV Fallback)
+    # Render Matplotlib figure to an in-memory PNG buffer for spreadsheet embedding
+    img_buffer = io.BytesIO()
+    fig.savefig(img_buffer, format="png", bbox_inches="tight", dpi=150)
+    img_buffer.seek(0)
+    
+    # Generate Multi-Tab Excel Document with Embedded Graphic Chart
     excel_buffer = io.BytesIO()
-    try:
-        with pd.ExcelWriter(excel_buffer) as writer:
-            # Main Data Tab
-            df_results.to_excel(writer, sheet_name="Exposure_Data", index=False)
-            
-            # Address Metadata Tab
-            meta_df = pd.DataFrame([{
-                "User_Entered_Address": meta.get("user_entered", "N/A"),
-                "Validated_Address": meta.get("validated", "N/A"),
-                "Target_Latitude": meta.get("target_lat"),
-                "Target_Longitude": meta.get("target_lon"),
-                "Weather_Grid_Latitude": meta.get("grid_lat"),
-                "Weather_Grid_Longitude": meta.get("grid_lon"),
-                "Grid_Distance_Miles": meta.get("distance_miles")
-            }])
-            meta_df.to_excel(writer, sheet_name="Location_Details", index=False)
-            
-        file_data = excel_buffer.getvalue()
-        file_name = f"Heat_Stress_Report_{file_date_str}.xlsx"
-        mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        button_label = "Download Compliance Report Spreadsheet (.XLSX)"
+    
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        # Sheet 1: Hourly Exposure Matrix Data
+        df_results.to_excel(writer, sheet_name="Exposure_Data", index=False)
         
-    except ImportError:
-        # Failsafe logic if pandas Excel-engines (like openpyxl) are missing in the environment
-        csv_buffer = io.StringIO()
-        csv_buffer.write("LOCATION DETAILS\n")
-        csv_buffer.write(f"User Entered Address,{meta.get('user_entered', 'N/A')}\n")
-        csv_buffer.write(f"Validated Address,{meta.get('validated', 'N/A')}\n")
-        csv_buffer.write(f"Target Latitude,{meta.get('target_lat')}\n")
-        csv_buffer.write(f"Target Longitude,{meta.get('target_lon')}\n")
-        csv_buffer.write(f"Weather Grid Latitude,{meta.get('grid_lat')}\n")
-        csv_buffer.write(f"Weather Grid Longitude,{meta.get('grid_lon')}\n")
-        csv_buffer.write(f"Grid Distance (Miles),{meta.get('distance_miles')}\n")
-        csv_buffer.write("\nEXPOSURE DATA\n")
+        # Sheet 2: Site Location & Meteorological Audit Trail
+        meta_df = pd.DataFrame([{
+            "User_Entered_Address": meta.get("user_entered", "N/A"),
+            "Validated_Address": meta.get("validated", "N/A"),
+            "Target_Latitude": meta.get("target_lat"),
+            "Target_Longitude": meta.get("target_lon"),
+            "Weather_Grid_Latitude": meta.get("grid_lat"),
+            "Weather_Grid_Longitude": meta.get("grid_lon"),
+            "Grid_Distance_Miles": meta.get("distance_miles")
+        }])
+        meta_df.to_excel(writer, sheet_name="Location_Details", index=False)
         
-        df_results.to_csv(csv_buffer, index=False)
+        # Access openpyxl workbook structure to embed image onto Exposure_Data tab
+        workbook = writer.book
+        exposure_sheet = writer.sheets["Exposure_Data"]
         
-        file_data = csv_buffer.getvalue().encode('utf-8')
-        file_name = f"Heat_Stress_Report_{file_date_str}.csv"
-        mime_type = "text/csv"
-        button_label = "Download Compliance Report Spreadsheet (.CSV)"
+        excel_img = OpenPyxlImage(img_buffer)
+        excel_img.width = 650
+        excel_img.height = 380
         
-    st.download_button(label=button_label, data=file_data, file_name=file_name, mime=mime_type)
+        # Position graphic image neatly below the results matrix
+        insert_row = len(df_results) + 4
+        exposure_sheet.add_image(excel_img, f"A{insert_row}")
+        
+    excel_file_data = excel_buffer.getvalue()
+    file_name = f"Heat_Stress_Report_{file_date_str}.xlsx"
+    
+    st.download_button(
+        label="Download Compliance Report Spreadsheet (.XLSX)",
+        data=excel_file_data,
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
     
     st.divider()
     if st.button("🔄 Execute Fresh Inspection Run"):
