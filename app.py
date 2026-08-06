@@ -36,8 +36,6 @@ st.set_page_config(page_title="OSHA-WBGT Localized Calculator", layout="wide")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
-if "resolved_geo" not in st.session_state:
-    st.session_state.resolved_geo = None
 if "final_hourly_rows" not in st.session_state:
     st.session_state.final_hourly_rows = None
 if "worker_weight" not in st.session_state:
@@ -59,16 +57,12 @@ if "standard_choice" not in st.session_state:
 if "location_meta" not in st.session_state:
     st.session_state.location_meta = {}
 
-def clear_resolved_geo():
-    """Callback to clear the confirmed location if the user modifies an input field."""
-    if "resolved_geo" in st.session_state:
-        st.session_state.resolved_geo = None
-
 # =====================================================================
 # GEOCODING & METEOROLOGICAL UTILITIES
 # =====================================================================
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 3958.8  
+    """Calculates the great-circle distance between two points in miles using the Haversine formula."""
+    R = 3958.8  # Earth radius in miles
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
@@ -176,6 +170,7 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12
     
     if is_sun:
         wind_ms = max(wind_mph * 0.44704, 0.1)
+        # Diurnal solar radiation scaling curve (peaks around 12:00-13:00, zero at night)
         if 6 <= hour_24h <= 18:
             solar_rad = 850.0 * math.sin(math.pi * (hour_24h - 6) / 12.0)
         else:
@@ -439,296 +434,313 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
         ax.scatter(x_watts, y_shade, color='darkblue', marker='p', s=120, zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
         
         for i, r in enumerate(results):
-            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), xytext=(5, 5), textcoords="offset points", fontsize=8, color='darkred', weight='bold')
+            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
+            ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
     else:
-        ax.scatter(x_watts, y_sun, color='darkred', marker='o', s=110, zorder=5, edgecolor='black', label='Sun WBGT Data Point')
-        ax.scatter(x_watts, y_shade, color='darkblue', marker='o', s=110, zorder=5, edgecolor='black', label='Shade WBGT Data Point')
+        ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
+        ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
+        
         for i, r in enumerate(results):
-            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), xytext=(5, 5), textcoords="offset points", fontsize=8, color='darkred')
-    
-    date_label = f"({results[0]['Date']} - Forecasted Data)" if is_forecast else f"({results[0]['Date']} - Historical Data)" if results else ""
-    title_str = f"OSHA/NIOSH Estimated WBGT Heat Stress Profile vs Limit Curves {date_label}\n"
-    title_str += f"Worker Body Mass: {worker_weight} lbs"
-    if use_caf: title_str += f" | Clothing Profile: {caf_label}"
-    
-    ax.set_title(title_str, fontsize=12, fontweight='bold', pad=15)
-    ax.set_xlabel('Metabolic Workload (Watts, Mass-Adjusted)', fontsize=11, fontweight='bold')
-    ax.set_ylabel('Effective WBGT Exposure Level (°F)', fontsize=11, fontweight='bold')
+            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
+            ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
+
+    title_prefix = "Predictive" if is_forecast else "Historical"
+    caf_subtitle = f"\nClothing Adjustment Factor (CAF): {caf_label}" if use_caf else ""
+    ax.set_title(f"{standard_prefix} Heat Stress Analytical Assessment Plot ({title_prefix}){caf_subtitle}\nWorker Structural Weight: {worker_weight:.1f} lbs", fontsize=11, fontweight='bold')
+    ax.set_xlabel("Adjusted Metabolic Rate (Watts)", fontsize=11)
+    ax.set_ylabel("Wet Bulb Globe Temperature Index (WBGT in °F)", fontsize=11)
     
     ax.set_xlim(90, 610)
-    ax.set_ylim(65, 115)
     
-    ax.fill_between(watts_range, limit_curve_f, 115, color='crimson', alpha=0.08)
-    ax.fill_between(watts_range, alert_curve_f, limit_curve_f, color='orange', alpha=0.08)
-    ax.fill_between(watts_range, 65, alert_curve_f, color='green', alpha=0.08)
+    y_min_bound = 65
+    y_max_bound = max(98, max_wbgt + 5 if x_watts else 98)
+    ax.set_ylim(y_min_bound, y_max_bound)
     
-    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.grid(True, linestyle=':', alpha=0.5)
     ax.legend(loc='upper right', framealpha=0.9)
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=300)
-    buf.seek(0)
-    return buf
+    return fig
 
 # =====================================================================
-# STREAMLIT UI: SIDEBAR CONFIGURATION
+# UI / STREAMLIT APP ENGINE
 # =====================================================================
-st.sidebar.title("App Settings & Secrets")
-st.sidebar.markdown("---")
+st.session_state.is_forecast = st.toggle(
+    "📅 Switch to Future Forecast Mode (For Planning & Prediction)", 
+    value=st.session_state.is_forecast,
+    disabled=(st.session_state.step > 1)
+)
 
-st.session_state.standard_choice = st.sidebar.radio("Limit Matrix Reference Standard:", ["NIOSH (Default)", "ACGIH (2022+)"])
+if st.session_state.is_forecast:
+    st.title("🌤️ OSHA-WBGT Predictive Forecast Calculator")
+    st.warning("**LEGAL DISCLAIMER & WARNING:** This tool is currently utilizing *forecasted* meteorological models for future planning. Weather conditions are inherently dynamic and can shift rapidly. These predictions may not perfectly reflect actual micro-climate conditions on site. Employers must not rely solely on this forecast; on-site environmental monitoring and situational awareness remain mandatory to ensure worker safety and compliance. This output is for preliminary hazard planning purposes only.")
+else:
+    st.title("☀️ OSHA-WBGT Localized Calculator")
 
-mapbox_secret = st.sidebar.text_input("Mapbox API Key (Optional Fallback):", type="password")
+st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
+st.divider()
 
-st.sidebar.markdown("---")
-if st.sidebar.button("Clear Application Cache", type="secondary"):
-    st.cache_resource.clear()
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.rerun()
+mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
 
-st.title("OSHA-WBGT Localized Heat Stress Estimator")
-st.markdown("Automated compliance tool utilizing local weather grids and web integration. Calculates estimated Sun and Shade Wet Bulb Globe Temperature (WBGT) thresholds.")
-
-# =====================================================================
-# STEP 1: VERIFY TARGET LOCATION & TIMING
-# =====================================================================
+# --- WIZARD STEP 1: UI-BASED TARGET PARAMETER INPUTS ---
 if st.session_state.step == 1:
-    st.subheader("Step 1: Set Target Location & Shift Parameters")
+    st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
-    c_mode1, c_mode2 = st.columns([1, 1])
-    with c_mode1:
-        input_mode = st.radio("Location Input Method", ["Address Search", "Exact GPS Coordinates"], on_change=clear_resolved_geo)
-
-    st.markdown("#### Geographic Selection")
-    if input_mode == "Address Search":
-        c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
-        with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 7339 State Road", on_change=clear_resolved_geo)
-        with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Philadelphia", on_change=clear_resolved_geo)
-        with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., PA", on_change=clear_resolved_geo)
-        with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 19136", on_change=clear_resolved_geo)
-    else:
-        c_gps1, c_gps2 = st.columns(2)
-        with c_gps1: target_lat_input = st.text_input("Latitude", value="", placeholder="e.g., 40.0345", on_change=clear_resolved_geo)
-        with c_gps2: target_lon_input = st.text_input("Longitude", value="", placeholder="e.g., -75.0181", on_change=clear_resolved_geo)
-
-    st.markdown("#### Meteorological Setup")
-    c_date1, c_date2, c_date3, c_date4 = st.columns(4)
-    with c_date1: target_date = st.date_input("Inspection Date", value=date.today(), max_value=date.today() + timedelta(days=14))
-    with c_date2: start_hour = st.number_input("Shift Start Hour (0-23)", min_value=0, max_value=23, value=11, step=1)
-    with c_date3: end_hour = st.number_input("Shift End Hour (0-23)", min_value=0, max_value=23, value=15, step=1)
-    with c_date4: worker_weight = st.number_input("Worker Total Mass (lbs)", min_value=90.0, max_value=400.0, value=154.0, step=1.0)
+    st.markdown("**Location Details**")
+    c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
+    with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 501 Aldon Rd")
+    with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Dallas")
+    with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., TX")
+    with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 75201")
     
-    st.markdown("#### Clothing Adjustments (CAF)")
-    caf_enabled = st.checkbox("Apply Clothing Adjustment Factor (CAF)?")
-    if caf_enabled:
-        caf_selection = st.selectbox("Select Worker Ensemble (Applies penalty to WBGT):", [
-            "Standard Work Clothes (+0.0)", "Double-Layer Uniform (+5.4)", "Vapor-Barrier Suit (+19.8)"
-        ])
+    st.markdown("**Shift & Employee Details**")
+    c_shift1, c_shift2, c_shift3 = st.columns([1.5, 2, 1.5])
     
-    if st.button("Verify Location", type="secondary"):
-        if input_mode == "Exact GPS Coordinates":
-            try:
-                lat_val = float(target_lat_input)
-                lon_val = float(target_lon_input)
-                st.session_state.resolved_geo = {
-                    "latitude": lat_val,
-                    "longitude": lon_val,
-                    "matched_address": f"Exact GPS Input ({lat_val}, {lon_val})",
-                    "raw_entered": f"{lat_val}, {lon_val}",
-                    "fallback_used": False
-                }
-            except ValueError:
-                st.error("Please enter valid numerical coordinates.")
+    today_date = date.today()
+    with c_shift1: 
+        if st.session_state.is_forecast:
+            target_date = st.date_input("Planned Work Date", value=today_date, min_value=today_date, max_value=today_date + timedelta(days=14))
         else:
-            if not target_city.strip() and not target_zip.strip() and not target_street.strip():
-                st.warning("Please supply at least a City/State, ZIP Code, or Street Address.")
-            elif start_hour > end_hour:
-                st.error("End hour must be equal to or greater than the Start hour.")
-            else:
-                with st.spinner("Resolving coordinates..."):
-                    geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
-                    if "error" in geo:
-                        st.error(geo["error"])
-                    else:
-                        st.session_state.resolved_geo = {
-                            "latitude": geo["latitude"],
-                            "longitude": geo["longitude"],
-                            "matched_address": geo.get("matched_address", raw_entered_address),
-                            "raw_entered": raw_entered_address,
-                            "fallback_used": fallback_used and bool(target_street.strip())
-                        }
-    
-    if st.session_state.resolved_geo:
-        st.markdown("---")
-        st.markdown("### Location Verification")
-        st.success(f"**Matched Location:** {st.session_state.resolved_geo['matched_address']}")
-        st.info(f"**Coordinates:** Lat {st.session_state.resolved_geo['latitude']}, Lon {st.session_state.resolved_geo['longitude']}")
-
-        if st.session_state.resolved_geo.get("fallback_used"):
-            st.warning("Exact street address could not be resolved. Defaulting to general City/State/ZIP coordinates. Please confirm this is acceptable.")
-
-        today_dt = date.today()
-        is_forecast = target_date > today_dt
-        button_text = "Confirm Location & Fetch Forecasted Weather" if is_forecast else "Confirm Location & Fetch Historical Weather"
-        
-        if st.button(button_text, type="primary"):
-            st.session_state.is_forecast = is_forecast
-            st.session_state.worker_weight = float(worker_weight)
-            st.session_state.location_fallback = st.session_state.resolved_geo.get("fallback_used", False)
+            target_date = st.date_input("Inspection Date", value=today_date - timedelta(days=1), max_value=today_date)
             
-            st.session_state.use_caf = caf_enabled
-            if caf_enabled:
-                st.session_state.caf_label = caf_selection.split(" (+")[0]
-                st.session_state.caf_value = float(caf_selection.split("(+")[1].replace(")", ""))
-            else:
-                st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
-                st.session_state.caf_value = 0.0
-
-            geo_lat = st.session_state.resolved_geo["latitude"]
-            geo_lon = st.session_state.resolved_geo["longitude"]
-            matched_address = st.session_state.resolved_geo["matched_address"]
-            raw_entered_address = st.session_state.resolved_geo["raw_entered"]
-
-            st.session_state.location_meta = {
-                "geo_lat": geo_lat,
-                "geo_lon": geo_lon,
-                "matched_address": matched_address,
-                "raw_entered_address": raw_entered_address
-            }
-
-            with st.spinner("Pulling meteorological timeline from Open-Meteo Open Source Grid..."):
-                date_str = target_date.strftime("%Y-%m-%d")
-                weather_res = fetch_weather_native(geo_lat, geo_lon, date_str, is_forecast)
+    with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
+    with c_shift3: worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
+    
+    button_text = "Fetch Forecasted Weather Data" if st.session_state.is_forecast else "Fetch Historical Weather Data"
+    
+    if st.button(button_text, type="primary"):
+        if not target_city.strip() and not target_zip.strip():
+            st.warning("Please supply at least a City/State or ZIP Code.")
+        else:
+            with st.spinner("Resolving coordinates & pulling weather timeline from Open-Meteo..."):
+                geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
                 
-                if "error" in weather_res:
-                    st.error(weather_res["error"])
+                if "error" in geo: 
+                    st.error(geo["error"])
                 else:
-                    h_data = weather_res["hourly"]
-                    w_lat = weather_res["grid_latitude"]
-                    w_lon = weather_res["grid_longitude"]
-                    grid_dist = haversine_distance(geo_lat, geo_lon, w_lat, w_lon)
-                    
-                    if "time" not in h_data:
-                        st.error("Meteorological data missing for requested date. It may be too far in the past or future.")
-                    else:
-                        hourly_rows = []
-                        tz_val = get_osha_tz_value(geo_lon)
+                    if fallback_used and target_street.strip():
+                        st.warning("Exact street address could not be resolved. Defaulting to general City/State/ZIP coordinates.")
                         
-                        try:
-                            for idx, t_iso in enumerate(h_data["time"]):
-                                dt_obj = datetime.fromisoformat(t_iso)
-                                hr = dt_obj.hour
-                                if start_hour <= hr <= end_hour:
-                                    temp_f = h_data["temperature_2m"][idx]
-                                    rh_val = h_data["relative_humidity_2m"][idx]
-                                    wind_val = h_data["wind_speed_10m"][idx]
-                                    pressure = h_data.get("surface_pressure", [29.92]*len(h_data["time"]))[idx]
-                                    
-                                    pressure_inhg = float(pressure) * 0.02953
-                                    
-                                    hourly_rows.append({
-                                        "date_string_final": date_str,
-                                        "time_display": dt_obj.strftime("%I:00 %p"),
-                                        "hour_24h": hr,
-                                        "temperature_f": temp_f,
-                                        "relative_humidity_percent": rh_val,
-                                        "wind_speed_mph": wind_val,
-                                        "barometric_pressure_inhg": pressure_inhg,
-                                        "latitude": geo_lat,
-                                        "longitude": geo_lon,
-                                        "longitude_absolute": abs(geo_lon),
-                                        "grid_latitude": w_lat,
-                                        "grid_longitude": w_lon,
-                                        "grid_distance_miles": grid_dist,
-                                        "tz_value": tz_val,
-                                        "user_entered_address": raw_entered_address,
-                                        "validated_address": matched_address
-                                    })
-                            
-                            st.session_state.final_hourly_rows = hourly_rows
+                    st.session_state.location_fallback = fallback_used and bool(target_street.strip())
+                    
+                    date_str = target_date.strftime("%Y-%m-%d")
+                    weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
+                    
+                    if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]: 
+                        st.error("Could not pull valid weather timeline matrices for this date/location.")
+                    else:
+                        hourly = weather_res["hourly"]
+                        grid_lat = weather_res["grid_latitude"]
+                        grid_lon = weather_res["grid_longitude"]
+                        
+                        dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
+                        
+                        st.session_state.location_meta = {
+                            "user_entered": raw_entered_address,
+                            "validated": geo.get("matched_address", raw_entered_address),
+                            "target_lat": geo["latitude"],
+                            "target_lon": geo["longitude"],
+                            "grid_lat": grid_lat,
+                            "grid_lon": grid_lon,
+                            "distance_miles": dist_miles
+                        }
+                        
+                        active_rows = []
+                        for i in range(len(hourly["time"])):
+                            hr_int = int(hourly["time"][i].split("T")[1].split(":")[0])
+                            if start_hour <= hr_int <= end_hour:
+                                ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
+                                active_rows.append({
+                                    "date_string_final": target_date.strftime("%m/%d/%Y"), 
+                                    "time_display": ampm, "hour_24h": hr_int,
+                                    "user_entered_address": raw_entered_address,
+                                    "validated_address": geo.get("matched_address", raw_entered_address),
+                                    "latitude": geo["latitude"], "longitude": geo["longitude"],
+                                    "grid_latitude": grid_lat, "grid_longitude": grid_lon,
+                                    "grid_distance_miles": dist_miles,
+                                    "longitude_absolute": abs(geo["longitude"]), 
+                                    "tz_value": get_osha_tz_value(geo["longitude"]),
+                                    "temperature_f": hourly["temperature_2m"][i], "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
+                                    "wind_speed_mph": hourly["wind_speed_10m"][i], "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
+                                })
+                        
+                        if not active_rows: 
+                            st.error("No hours matched your operational shift boundaries.")
+                        else:
+                            st.session_state.final_hourly_rows = active_rows
+                            st.session_state.worker_weight = worker_weight
                             st.session_state.step = 2
                             st.rerun()
-                        except Exception as parse_error:
-                            st.error(f"Failed to process meteorological timeline: {parse_error}")
 
-# =====================================================================
-# STEP 2: METABOLIC WORKLOAD CONFIGURATION
-# =====================================================================
+# --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
 elif st.session_state.step == 2:
-    st.subheader("Step 2: Calibrate Metabolic Workloads per Shift Hour")
-    st.info("Set the primary workload profile for each timeframe. (Mass corrections are applied algorithmically before evaluation).")
+    st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
-    rows = st.session_state.final_hourly_rows
-    worker_mass = st.session_state.worker_weight
+    # --- HEAT STRESS STANDARD SELECTION ---
+    st.markdown("### Heat Stress Standard")
+    standard_choice = st.radio(
+        "Select Evaluation Standard", 
+        ["NIOSH (Default)", "ACGIH (Requires Permission)"],
+        help="NIOSH values are public domain. ACGIH values are copyrighted intellectual property."
+    )
+    st.session_state.standard_choice = standard_choice
     
-    workload_mapping = {
-        "Light (Sitting/Standing, Light Arms)": 180,
-        "Moderate (Walking, Moderate Lifting)": 300,
-        "Heavy (Heavy Lifting, Fast Walking)": 415,
-        "Very Heavy (Intense Shoveling/Running)": 520
-    }
+    if "ACGIH" in standard_choice:
+        st.warning("**LEGAL DISCLAIMER:** TLVs® and BEIs® are copyrighted property of the American Conference of Governmental Industrial Hygienists (ACGIH®). This application is not endorsed by, sponsored by, or affiliated with ACGIH. This toggle is included for internal testing and pending formal permission.")
     
-    with st.form("workload_matrix"):
-        for i, row in enumerate(rows):
-            st.markdown(f"**Hour Slot:** {row['time_display']} (Base Temp: {row['temperature_f']}°F, RH: {row['relative_humidity_percent']}%, Wind: {row['wind_speed_mph']} mph)")
-            selected_load = st.selectbox(f"Workload Profile for {row['time_display']}:", options=list(workload_mapping.keys()), key=f"wl_{i}")
-            rows[i]["workload_label"] = selected_load
-            
-            base_watts = workload_mapping[selected_load]
-            mass_correction_factor = worker_mass / 154.0
-            rows[i]["final_watts"] = round(base_watts * mass_correction_factor, 1)
-            st.divider()
-            
-        if st.form_submit_button("Initiate Regulatory Analysis & Scrape Engine", type="primary"):
-            st.session_state.final_hourly_rows = rows
-            st.session_state.step = 3
-            st.rerun()
-            
-    if st.button("Cancel & Return to Setup"):
-        st.session_state.step = 1
-        st.rerun()
-
-# =====================================================================
-# STEP 3: EXPOSURE RESULTS & GRAPHICS
-# =====================================================================
-elif st.session_state.step == 3:
-    st.subheader("Step 3: Exposure Threshold Findings")
+    # --- CLOTHING ADJUSTMENT FACTOR (CAF) CONFIGURATION ---
+    st.markdown("### Clothing & PPE Adjustment Factor (Optional)")
+    use_caf = st.toggle("Apply Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
+    caf_value = 0.0
+    caf_label = "Standard Work Clothes (0.0 °F)"
     
-    source_label = "Open-Meteo Grid (Forecasted)" if st.session_state.is_forecast else "Open-Meteo Grid (Historical)"
-    
-    st.markdown("#### Execution Log")
-    computed_data = run_browser_automation(st.session_state.final_hourly_rows, source_label, st.session_state.standard_choice)
-    
-    st.markdown("---")
-    st.markdown("#### Formalized Assessment Graph")
-    plot_buffer = generate_compliance_plot(computed_data, st.session_state.worker_weight, st.session_state.is_forecast, st.session_state.use_caf, st.session_state.caf_label, st.session_state.standard_choice)
-    st.image(plot_buffer, use_column_width=True)
-    
-    if st.session_state.fallback_active:
-        st.warning("**Compliance Note:** Primary OSHA scraping connectivity was disrupted during execution. WBGT thresholds were automatically mapped using an offline stull approximation algorithm.")
-
-    st.markdown("#### Tabular Shift Breakdown")
-    for rec in computed_data:
-        st.write(f"**{rec['Time']}** | Load: {rec['Adjusted_Watts']} W | Temp: {rec['Air_Temp_F']} °F | RH: {rec['Humidity_Pct']} % | **Sun WBGT: {rec['Sun_WBGT_F']} °F** | **Shade WBGT: {rec['Shade_WBGT_F']} °F** | State: `{rec['Safety_Status']}`")
-
-    st.markdown("---")
-    csv_buffer = io.StringIO()
-    if computed_data:
-        writer = csv.DictWriter(csv_buffer, fieldnames=computed_data[0].keys())
-        writer.writeheader()
-        for c in computed_data: writer.writerow(c)
+    if use_caf:
+        caf_dict = {
+            "Short sleeves and pants (-1.8 °F)": -1.8,
+            "Work clothes / Cloth coveralls (0.0 °F)": 0.0,
+            "SMS polypropylene coveralls (+0.9 °F)": 0.9,
+            "Polyolefin coveralls (+1.8 °F)": 1.8,
+            "Double-layer woven clothing (+5.4 °F)": 5.4,
+            "Limited-use vapor-barrier coveralls (+19.8 °F)": 19.8
+        }
+        caf_choice = st.selectbox("Select Clothing Ensemble / PPE Type", list(caf_dict.keys()))
+        caf_value = caf_dict[caf_choice]
+        caf_label = caf_choice
+        st.info(f"ℹ️ Active CAF Correction: **{caf_value:+.1f} °F** will be added to the calculated WBGT values.")
         
-        st.download_button(
-            label="Download Diagnostic CSV Log",
-            data=csv_buffer.getvalue(),
-            file_name=f"osha_wbgt_diagnostic_{computed_data[0]['Date']}.csv",
-            mime="text/csv",
-            type="primary"
+    st.session_state.use_caf = use_caf
+    st.session_state.caf_value = caf_value
+    st.session_state.caf_label = caf_label
+    
+    st.divider()
+    use_clinical = st.toggle("Advanced Clinical / Custom Workload", value=False)
+    
+    account_for_weight = True
+    clinical_method = "Standard Ainsworth (Weight Only)"
+    sex = "Male"
+    age = 35
+    height_in = 70.0
+    
+    if use_clinical:
+        st.info("Clinical Mode Active: Enter specific Ainsworth MET values for each hour below.")
+        account_for_weight = st.toggle("Account for employee physiological data?", value=True)
+        
+        if account_for_weight:
+            clinical_method = st.radio(
+                "Metabolic Calculation Method", 
+                ["Standard Ainsworth (Weight Only)", "Corrected METs (Mifflin-St Jeor)"],
+                help="Standard uses a flat 1 kcal/kg/hr baseline. Corrected uses the clinical Mifflin-St Jeor equation for precise Resting Metabolic Rate."
+            )
+            if clinical_method == "Corrected METs (Mifflin-St Jeor)":
+                st.markdown("**Enter Worker Biometrics:**")
+                c_bio1, c_bio2, c_bio3 = st.columns(3)
+                sex = c_bio1.selectbox("Biological Sex", ["Male", "Female"])
+                age = c_bio2.number_input("Age (Years)", min_value=18, max_value=100, value=35)
+                height_in = c_bio3.number_input("Height (Inches)", min_value=40.0, max_value=90.0, value=70.0)
+    
+    st.divider()
+    
+    preset_map = {"Light (180W)": 180, "Moderate (300W)": 300, "Heavy (415W)": 415, "Very Heavy (520W)": 520}
+    selections = {}
+    cols = st.columns(min(len(st.session_state.final_hourly_rows), 4))
+    
+    for idx, row in enumerate(st.session_state.final_hourly_rows):
+        col_target = cols[idx % len(cols)]
+        with col_target:
+            if not use_clinical:
+                selections[row["hour_24h"]] = st.selectbox(f"Hour: {row['time_display']}", options=list(preset_map.keys()), index=1, key=f"sel_{row['hour_24h']}")
+            else:
+                selections[row["hour_24h"]] = st.number_input(f"Hour: {row['time_display']} (METs)", min_value=0.9, max_value=18.0, value=3.5, step=0.1, key=f"met_{row['hour_24h']}")
+                
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("← Modify Location or Timeline"):
+            st.session_state.step = 1
+            st.rerun()
+    with c2:
+        if st.button("Run Scraper & Generate Analysis →", type="primary"):
+            for row in st.session_state.final_hourly_rows:
+                if not use_clinical:
+                    chosen_w = preset_map[selections[row["hour_24h"]]]
+                    row["workload_label"] = selections[row["hour_24h"]].split(" ")[0]
+                    row["final_watts"] = round((chosen_w * st.session_state.worker_weight) / 154.0, 1)
+                else:
+                    met_val = selections[row["hour_24h"]]
+                    worker_kg = st.session_state.worker_weight * 0.453592
+                    
+                    if not account_for_weight:
+                        calc_watts = met_val * 70.0 * 1.163
+                    else:
+                        if clinical_method == "Standard Ainsworth (Weight Only)":
+                            calc_watts = met_val * worker_kg * 1.163
+                        else:
+                            height_cm = height_in * 2.54
+                            if sex == "Male": rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) + 5
+                            else: rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) - 161
+                            rmr_kcal_hr = rmr_kcal_day / 24.0
+                            calc_watts = met_val * rmr_kcal_hr * 1.16222
+                    
+                    row["workload_label"] = f"{met_val} METs"
+                    row["final_watts"] = round(calc_watts, 1)
+                
+            with st.spinner("Executing calculations..."):
+                data_source_label = (
+                    "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
+                    if st.session_state.is_forecast 
+                    else "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
+                )
+                results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
+                
+            if results:
+                st.session_state.results = results
+                st.session_state.step = 3
+                st.rerun()
+
+# --- WIZARD STEP 3: INTERACTIVE REPORT VIEWER & EXPORT ---
+elif st.session_state.step == 3:
+    st.subheader("Step 3: Compliance Engineering Summary Analysis Output")
+    
+    if st.session_state.fallback_active: 
+        st.warning("⚠️ **Playwright Fallback Active**: The system successfully estimated WBGT offline utilizing Stull's equation.")
+    else: 
+        st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
+        
+    meta = st.session_state.get("location_meta", {})
+    if meta:
+        st.info(
+            f"📍 **Address Audit Trail:**\n"
+            f"* **Entered Address:** {meta.get('user_entered', 'N/A')}\n"
+            f"* **Validated/Geocoded Address:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})\n"
+            f"* **Open-Meteo Grid Point:** Lat {meta.get('grid_lat')}, Lon {meta.get('grid_lon')}\n"
+            f"* **Distance to Weather Data Grid Point:** **{meta.get('distance_miles', 0.0):.2f} miles**"
         )
         
-    if st.button("Execute Fresh Inspection Run", type="secondary"):
+    fig = generate_compliance_plot(
+        st.session_state.results, 
+        st.session_state.worker_weight, 
+        st.session_state.is_forecast, 
+        st.session_state.use_caf, 
+        st.session_state.caf_label,
+        st.session_state.standard_choice
+    )
+    st.pyplot(fig)
+    
+    st.subheader("Raw Exposure Tracking Metrics Matrix")
+    st.dataframe(st.session_state.results, use_container_width=True)
+    
+    csv_buffer = io.StringIO()
+    writer = csv.DictWriter(csv_buffer, fieldnames=list(st.session_state.results[0].keys()))
+    writer.writeheader()
+    writer.writerows(st.session_state.results)
+    
+    st.download_button("Download Compliance Report Spreadsheet (.CSV)", data=csv_buffer.getvalue(), file_name=f"Heat_Stress_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+    
+    st.divider()
+    if st.button("🔄 Execute Fresh Inspection Run"):
         st.session_state.step = 1
-        st.session_state.resolved_geo = None
+        st.session_state.final_hourly_rows = None
+        st.session_state.fallback_active = False
+        st.session_state.location_fallback = False
+        st.session_state.use_caf = False
+        st.session_state.caf_value = 0.0
+        st.session_state.location_meta = {}
         st.rerun()
