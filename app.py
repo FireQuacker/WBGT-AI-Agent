@@ -28,6 +28,7 @@ from playwright.sync_api import sync_playwright
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
+import pandas as pd
 
 # =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
@@ -299,11 +300,10 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
                 elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
                 
+                # Removed cluttered address fields here
                 row_dict = {
                     "Date": hour["date_string_final"],
                     "Time": hour["time_display"], 
-                    "User_Entered_Address": hour["user_entered_address"],
-                    "Validated_Address": hour["validated_address"],
                     "Target_Latitude": hour["latitude"],
                     "Target_Longitude": hour["longitude"],
                     "Weather_Grid_Latitude": hour["grid_latitude"],
@@ -357,11 +357,10 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
             if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
             elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
             
+            # Removed cluttered address fields here
             row_dict = {
                 "Date": hour["date_string_final"],
                 "Time": hour["time_display"], 
-                "User_Entered_Address": hour["user_entered_address"],
-                "Validated_Address": hour["validated_address"],
                 "Target_Latitude": hour["latitude"],
                 "Target_Longitude": hour["longitude"],
                 "Weather_Grid_Latitude": hour["grid_latitude"],
@@ -798,14 +797,63 @@ elif st.session_state.step == 3:
     st.pyplot(fig)
     
     st.subheader("Raw Exposure Tracking Metrics Matrix")
-    st.dataframe(st.session_state.results, use_container_width=True)
     
-    csv_buffer = io.StringIO()
-    writer = csv.DictWriter(csv_buffer, fieldnames=list(st.session_state.results[0].keys()))
-    writer.writeheader()
-    writer.writerows(st.session_state.results)
+    # Load into dataframe (address columns already removed in step 2 processing)
+    df_results = pd.DataFrame(st.session_state.results)
+    st.dataframe(df_results, use_container_width=True)
     
-    st.download_button("Download Compliance Report Spreadsheet (.CSV)", data=csv_buffer.getvalue(), file_name=f"Heat_Stress_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
+    # Generate Date For Filename based on Exposure Matrix
+    if st.session_state.results:
+        raw_exposure_date = st.session_state.results[0]["Date"]
+        file_date_str = datetime.strptime(raw_exposure_date, "%m/%d/%Y").strftime("%Y%m%d")
+    else:
+        file_date_str = datetime.now().strftime("%Y%m%d")
+    
+    # Generate Download File Payload (Excel Tabbed File w/ CSV Fallback)
+    excel_buffer = io.BytesIO()
+    try:
+        with pd.ExcelWriter(excel_buffer) as writer:
+            # Main Data Tab
+            df_results.to_excel(writer, sheet_name="Exposure_Data", index=False)
+            
+            # Address Metadata Tab
+            meta_df = pd.DataFrame([{
+                "User_Entered_Address": meta.get("user_entered", "N/A"),
+                "Validated_Address": meta.get("validated", "N/A"),
+                "Target_Latitude": meta.get("target_lat"),
+                "Target_Longitude": meta.get("target_lon"),
+                "Weather_Grid_Latitude": meta.get("grid_lat"),
+                "Weather_Grid_Longitude": meta.get("grid_lon"),
+                "Grid_Distance_Miles": meta.get("distance_miles")
+            }])
+            meta_df.to_excel(writer, sheet_name="Location_Details", index=False)
+            
+        file_data = excel_buffer.getvalue()
+        file_name = f"Heat_Stress_Report_{file_date_str}.xlsx"
+        mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        button_label = "Download Compliance Report Spreadsheet (.XLSX)"
+        
+    except ImportError:
+        # Failsafe logic if pandas Excel-engines (like openpyxl) are missing in the environment
+        csv_buffer = io.StringIO()
+        csv_buffer.write("LOCATION DETAILS\n")
+        csv_buffer.write(f"User Entered Address,{meta.get('user_entered', 'N/A')}\n")
+        csv_buffer.write(f"Validated Address,{meta.get('validated', 'N/A')}\n")
+        csv_buffer.write(f"Target Latitude,{meta.get('target_lat')}\n")
+        csv_buffer.write(f"Target Longitude,{meta.get('target_lon')}\n")
+        csv_buffer.write(f"Weather Grid Latitude,{meta.get('grid_lat')}\n")
+        csv_buffer.write(f"Weather Grid Longitude,{meta.get('grid_lon')}\n")
+        csv_buffer.write(f"Grid Distance (Miles),{meta.get('distance_miles')}\n")
+        csv_buffer.write("\nEXPOSURE DATA\n")
+        
+        df_results.to_csv(csv_buffer, index=False)
+        
+        file_data = csv_buffer.getvalue().encode('utf-8')
+        file_name = f"Heat_Stress_Report_{file_date_str}.csv"
+        mime_type = "text/csv"
+        button_label = "Download Compliance Report Spreadsheet (.CSV)"
+        
+    st.download_button(label=button_label, data=file_data, file_name=file_name, mime=mime_type)
     
     st.divider()
     if st.button("🔄 Execute Fresh Inspection Run"):
