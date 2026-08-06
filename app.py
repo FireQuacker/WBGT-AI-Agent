@@ -54,10 +54,22 @@ if "caf_label" not in st.session_state:
     st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
 if "standard_choice" not in st.session_state:
     st.session_state.standard_choice = "NIOSH (Default)"
+if "location_meta" not in st.session_state:
+    st.session_state.location_meta = {}
 
 # =====================================================================
 # GEOCODING & METEOROLOGICAL UTILITIES
 # =====================================================================
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculates the great-circle distance between two points in miles using the Haversine formula."""
+    R = 3958.8  # Earth radius in miles
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0)**2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return round(R * c, 2)
+
 def get_osha_tz_value(lon: float) -> str:
     if lon >= -85.5: return "-5"
     elif lon >= -103.5: return "-6"
@@ -69,11 +81,11 @@ def get_osha_tz_value(lon: float) -> str:
 def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
     address_lower = address.lower()
     if "501" in address_lower and "claymont" in address_lower:
-        return {"latitude": 39.8115, "longitude": -75.4618}
+        return {"latitude": 39.8115, "longitude": -75.4618, "matched_address": "501 Claymont St, Claymont, DE, USA"}
     elif "dallas" in address_lower:
-        return {"latitude": 32.7767, "longitude": -96.7970}
+        return {"latitude": 32.7767, "longitude": -96.7970, "matched_address": "Dallas, TX, USA"}
     elif "houston" in address_lower:
-        return {"latitude": 29.7604, "longitude": -95.3698}
+        return {"latitude": 29.7604, "longitude": -95.3698, "matched_address": "Houston, TX, USA"}
 
     try:
         census_url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
@@ -85,7 +97,8 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
             matches = data.get("result", {}).get("addressMatches", [])
             if matches:
                 coords = matches[0]["coordinates"]
-                return {"latitude": coords["y"], "longitude": coords["x"]}
+                matched_str = matches[0].get("matchedAddress", address)
+                return {"latitude": coords["y"], "longitude": coords["x"], "matched_address": matched_str}
     except Exception as e:
         print(f"Census API attempt failed: {e}")
 
@@ -103,7 +116,8 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
             features = data.get("features", [])
             if features:
                 coords = features[0]["center"]
-                return {"latitude": coords[1], "longitude": coords[0]}
+                matched_str = features[0].get("place_name", address)
+                return {"latitude": coords[1], "longitude": coords[0], "matched_address": matched_str}
         
         return {"error": "Location coordinates could not be resolved."}
     except Exception as e:
@@ -124,14 +138,14 @@ def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_k
     if street:
         res1 = geocode_address_native(exact_address, mapbox_key)
         if "error" not in res1:
-            return res1, False 
+            return res1, False, exact_address
             
     if general_address:
         res2 = geocode_address_native(general_address, mapbox_key)
         if "error" not in res2:
-            return res2, True 
+            return res2, True, general_address
             
-    return {"error": "Location coordinates could not be resolved. Please verify City, State, and Zip Code."}, False
+    return {"error": "Location coordinates could not be resolved. Please verify City, State, and Zip Code."}, False, exact_address or general_address
 
 def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: bool) -> dict:
     url = "https://api.open-meteo.com/v1/forecast" if is_forecast else "https://archive-api.open-meteo.com/v1/archive"
@@ -144,7 +158,12 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
         response = requests.get(url, params=params)
         if response.status_code != 200:
             return {"error": f"Weather API blocked the request (HTTP {response.status_code})."}
-        return response.json()
+        data = response.json()
+        return {
+            "hourly": data.get("hourly", {}),
+            "grid_latitude": data.get("latitude", lat),
+            "grid_longitude": data.get("longitude", lon)
+        }
     except Exception as e:
         return {"error": f"Weather System Error: {str(e)}"}
 
@@ -284,8 +303,13 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 row_dict = {
                     "Date": hour["date_string_final"],
                     "Time": hour["time_display"], 
-                    "Latitude": hour["latitude"],
-                    "Longitude": hour["longitude"],
+                    "User_Entered_Address": hour["user_entered_address"],
+                    "Validated_Address": hour["validated_address"],
+                    "Target_Latitude": hour["latitude"],
+                    "Target_Longitude": hour["longitude"],
+                    "Weather_Grid_Latitude": hour["grid_latitude"],
+                    "Weather_Grid_Longitude": hour["grid_longitude"],
+                    "Grid_Distance_Miles": hour["grid_distance_miles"],
                     "Air_Temp_F": orig_temp, 
                     "Humidity_Pct": orig_rh, 
                     "Wind_Speed_mph": orig_ws,
@@ -337,8 +361,13 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
             row_dict = {
                 "Date": hour["date_string_final"],
                 "Time": hour["time_display"], 
-                "Latitude": hour["latitude"],
-                "Longitude": hour["longitude"],
+                "User_Entered_Address": hour["user_entered_address"],
+                "Validated_Address": hour["validated_address"],
+                "Target_Latitude": hour["latitude"],
+                "Target_Longitude": hour["longitude"],
+                "Weather_Grid_Latitude": hour["grid_latitude"],
+                "Weather_Grid_Longitude": hour["grid_longitude"],
+                "Grid_Distance_Miles": hour["grid_distance_miles"],
                 "Air_Temp_F": orig_temp, 
                 "Humidity_Pct": orig_rh, 
                 "Wind_Speed_mph": orig_ws,
@@ -484,7 +513,7 @@ if st.session_state.step == 1:
             st.warning("Please supply at least a City/State or ZIP Code.")
         else:
             with st.spinner("Resolving coordinates & pulling weather timeline from Open-Meteo..."):
-                geo, fallback_used = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
+                geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
                 
                 if "error" in geo: 
                     st.error(geo["error"])
@@ -495,12 +524,27 @@ if st.session_state.step == 1:
                     st.session_state.location_fallback = fallback_used and bool(target_street.strip())
                     
                     date_str = target_date.strftime("%Y-%m-%d")
-                    weather = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
+                    weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
                     
-                    if "error" in weather or "hourly" not in weather: 
+                    if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]: 
                         st.error("Could not pull valid weather timeline matrices for this date/location.")
                     else:
-                        hourly = weather["hourly"]
+                        hourly = weather_res["hourly"]
+                        grid_lat = weather_res["grid_latitude"]
+                        grid_lon = weather_res["grid_longitude"]
+                        
+                        dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
+                        
+                        st.session_state.location_meta = {
+                            "user_entered": raw_entered_address,
+                            "validated": geo.get("matched_address", raw_entered_address),
+                            "target_lat": geo["latitude"],
+                            "target_lon": geo["longitude"],
+                            "grid_lat": grid_lat,
+                            "grid_lon": grid_lon,
+                            "distance_miles": dist_miles
+                        }
+                        
                         active_rows = []
                         for i in range(len(hourly["time"])):
                             hr_int = int(hourly["time"][i].split("T")[1].split(":")[0])
@@ -509,7 +553,12 @@ if st.session_state.step == 1:
                                 active_rows.append({
                                     "date_string_final": target_date.strftime("%m/%d/%Y"), 
                                     "time_display": ampm, "hour_24h": hr_int,
-                                    "latitude": geo["latitude"], "longitude": geo["longitude"], "longitude_absolute": abs(geo["longitude"]), 
+                                    "user_entered_address": raw_entered_address,
+                                    "validated_address": geo.get("matched_address", raw_entered_address),
+                                    "latitude": geo["latitude"], "longitude": geo["longitude"],
+                                    "grid_latitude": grid_lat, "grid_longitude": grid_lon,
+                                    "grid_distance_miles": dist_miles,
+                                    "longitude_absolute": abs(geo["longitude"]), 
                                     "tz_value": get_osha_tz_value(geo["longitude"]),
                                     "temperature_f": hourly["temperature_2m"][i], "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
                                     "wind_speed_mph": hourly["wind_speed_10m"][i], "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
@@ -657,6 +706,16 @@ elif st.session_state.step == 3:
     else: 
         st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
         
+    meta = st.session_state.get("location_meta", {})
+    if meta:
+        st.info(
+            f"📍 **Address Audit Trail:**\n"
+            f"* **Entered Address:** {meta.get('user_entered', 'N/A')}\n"
+            f"* **Validated/Geocoded Address:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})\n"
+            f"* **Open-Meteo Grid Point:** Lat {meta.get('grid_lat')}, Lon {meta.get('grid_lon')}\n"
+            f"* **Distance to Weather Data Grid Point:** **{meta.get('distance_miles', 0.0):.2f} miles**"
+        )
+        
     fig = generate_compliance_plot(
         st.session_state.results, 
         st.session_state.worker_weight, 
@@ -685,4 +744,5 @@ elif st.session_state.step == 3:
         st.session_state.location_fallback = False
         st.session_state.use_caf = False
         st.session_state.caf_value = 0.0
+        st.session_state.location_meta = {}
         st.rerun()
