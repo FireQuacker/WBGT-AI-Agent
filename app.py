@@ -79,14 +79,6 @@ def get_osha_tz_value(lon: float) -> str:
     else: return "-10"
 
 def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
-    address_lower = address.lower()
-    if "501" in address_lower and "claymont" in address_lower:
-        return {"latitude": 39.8115, "longitude": -75.4618, "matched_address": "501 Claymont St, Claymont, DE, USA"}
-    elif "dallas" in address_lower:
-        return {"latitude": 32.7767, "longitude": -96.7970, "matched_address": "Dallas, TX, USA"}
-    elif "houston" in address_lower:
-        return {"latitude": 29.7604, "longitude": -95.3698, "matched_address": "Houston, TX, USA"}
-
     try:
         census_url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
         census_params = {"address": address, "benchmark": "Public_AR_Current", "format": "json"}
@@ -99,11 +91,11 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
                 coords = matches[0]["coordinates"]
                 matched_str = matches[0].get("matchedAddress", address)
                 return {"latitude": coords["y"], "longitude": coords["x"], "matched_address": matched_str}
-    except Exception as e:
-        print(f"Census API attempt failed: {e}")
+    except Exception:
+        pass
 
     if not mapbox_key:
-        return {"error": "US Census database could not pinpoint this address. Please add MAPBOX_API_KEY to your Streamlit secrets settings."}
+        return {"error": "US Census database could not pinpoint this address. Please verify address details or provide a MAPBOX_API_KEY in settings."}
     
     try:
         encoded_address = urllib.parse.quote(address)
@@ -145,7 +137,7 @@ def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_k
         if "error" not in res2:
             return res2, True, general_address
             
-    return {"error": "Location coordinates could not be resolved. Please verify City, State, and Zip Code."}, False, exact_address or general_address
+    return {"error": "Location coordinates could not be resolved. Please verify City, State, and ZIP Code."}, False, exact_address or general_address
 
 def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: bool) -> dict:
     url = "https://api.open-meteo.com/v1/forecast" if is_forecast else "https://archive-api.open-meteo.com/v1/archive"
@@ -167,7 +159,7 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
     except Exception as e:
         return {"error": f"Weather System Error: {str(e)}"}
 
-def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True):
+def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12, is_sun=True):
     tc = (temp_f - 32) * 5.0 / 9.0
     rh = rh_pct
     tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) 
@@ -178,9 +170,14 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, is_sun=True
     
     if is_sun:
         wind_ms = max(wind_mph * 0.44704, 0.1)
-        solar_rad = 800.0  
+        # Diurnal solar radiation scaling curve (peaks around 12:00-13:00, zero at night)
+        if 6 <= hour_24h <= 18:
+            solar_rad = 850.0 * math.sin(math.pi * (hour_24h - 6) / 12.0)
+        else:
+            solar_rad = 0.0
+            
         tg_c = tc + 0.015 * solar_rad - 0.12 * wind_ms
-        if tg_c < tc: tg_c = tc + 2.0
+        if tg_c < tc: tg_c = tc + 0.5
     else:
         tg_c = tc + 1.0
         
@@ -219,7 +216,8 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                         frame.locator('input[name="temp"]').wait_for(state="attached", timeout=1200)
                         target_frame = frame
                         break
-                    except: continue
+                    except Exception:
+                        continue
             except Exception as conn_error:
                 st.warning(f"Connection warning: {conn_error}. Attempting calculations directly.")
                 target_frame = page
@@ -258,7 +256,7 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     target_frame.locator('input[name="pres"]').fill(str(safe_pres))
                     
                     try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
-                    except: pass
+                    except Exception: pass
                     
                     time.sleep(0.1)
                     target_frame.locator('input[value="Submit"]').click()
@@ -276,13 +274,13 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                         sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip())
                         shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip())
                     else: row_fallback = True
-                except:
+                except Exception:
                     row_fallback = True
                 
                 if row_fallback:
                     st.session_state.fallback_active = True
-                    sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=True)
-                    shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
+                    sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour['hour_24h'], is_sun=True)
+                    shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour['hour_24h'], is_sun=False)
                     notes_str = "Offline Stull Fallback Used" if notes_str == "None" else notes_str + " | Offline Stull Fallback Used"
                 
                 if st.session_state.use_caf:
@@ -329,14 +327,14 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 
             browser.close()
             
-    except Exception as sys_err:
+    except Exception:
         st.session_state.fallback_active = True
         computed_results = []
         for index, hour in enumerate(hourly_data):
             orig_temp, orig_rh, orig_ws = float(hour['temperature_f']), int(hour['relative_humidity_percent']), float(hour['wind_speed_mph'])
             orig_pres = float(hour['barometric_pressure_inhg'])
-            sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=True)
-            shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, is_sun=False)
+            sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour['hour_24h'], is_sun=True)
+            shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour['hour_24h'], is_sun=False)
             
             if st.session_state.use_caf:
                 sun_f = round(sun_f + st.session_state.caf_value, 1)
@@ -488,10 +486,10 @@ if st.session_state.step == 1:
     
     st.markdown("**Location Details**")
     c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
-    with c_addr1: target_street = st.text_input("Street Address (Optional)", help="e.g., 501 Aldon Rd")
-    with c_addr2: target_city = st.text_input("City", value="Dallas")
-    with c_addr3: target_state = st.text_input("State", value="TX")
-    with c_addr4: target_zip = st.text_input("ZIP Code", value="")
+    with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 501 Aldon Rd")
+    with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Dallas")
+    with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., TX")
+    with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 75201")
     
     st.markdown("**Shift & Employee Details**")
     c_shift1, c_shift2, c_shift3 = st.columns([1.5, 2, 1.5])
@@ -519,7 +517,7 @@ if st.session_state.step == 1:
                     st.error(geo["error"])
                 else:
                     if fallback_used and target_street.strip():
-                        st.warning("Exact street address could not be resolved. Defaulting to general City/State/Zip coordinates.")
+                        st.warning("Exact street address could not be resolved. Defaulting to general City/State/ZIP coordinates.")
                         
                     st.session_state.location_fallback = fallback_used and bool(target_street.strip())
                     
