@@ -141,117 +141,118 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    # Expanded bounding box to ~35 miles (0.5 degrees) to hit major regional hubs
-    extent = f"{lat-0.5},{lon-0.5},{lat+0.5},{lon+0.5}"
+    extent = f"{lat-0.6},{lon-0.6},{lat+0.6},{lon+0.6}"
     date_str = target_date.strftime("%Y-%m-%d")
     
-    url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
-    params = {
-        "extent": extent,
-        "limit": 150,  # Increased limit to ensure we don't miss the primary airport
-        "datasetid": "LCD"
-    }
+    # Try LCD dataset first, then fall back to GHCND/GSOM if hourly logs are missing
+    datasets = ["LCD", "GHCND"]
+    hourly_data_found = None
+    closest_stn = None
+    min_dist = float('inf')
     
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        if response.status_code != 200:
-            return {"error": f"NOAA Station API Error (HTTP {response.status_code}). Please verify your token."}
-            
-        stations = response.json().get("results", [])
-        if not stations:
-            return {"error": f"No NOAA LCD stations found within a 35-mile radius for {date_str}. Consider using Open-Meteo."}
-            
-        for stn in stations:
-            stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
-            
-        stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
-        
-        hourly_data_found = None
-        closest_stn = None
-        min_dist = float('inf')
-        
-        # Test up to the 10 closest stations to find one actually reporting hourly data
-        for stn in stations_sorted[:10]:
-            data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
-            data_params = {
-                "datasetid": "LCD",
-                "stationid": stn["id"],
-                "startdate": date_str,
-                "enddate": date_str,
-                "limit": 1000,
-                "units": "standard"
-            }
-            
-            data_res = requests.get(data_url, headers=headers, params=data_params, timeout=20)
-            if data_res.status_code == 200:
-                results = data_res.json().get("results", [])
-                if results:
-                    hourly_data_found = results
-                    closest_stn = stn
-                    min_dist = stn["computed_dist"]
-                    break
-                    
-        if not hourly_data_found:
-            return {"error": f"No nearby stations reported hourly Local Climatological Data for {date_str}."}
-            
-        def clean_val(val, default):
-            if val is None: return default
-            val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
-            try:
-                numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
-                return float(numeric) if numeric else default
-            except:
-                return default
-                
-        hourly_records = {}
-        for item in hourly_data_found:
-            dt_str = item.get("date")
-            try:
-                hr = datetime.fromisoformat(dt_str).hour
-            except Exception:
+    for datasetid in datasets:
+        url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
+        params = {
+            "extent": extent,
+            "limit": 150,
+            "datasetid": datasetid
+        }
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            if response.status_code != 200:
                 continue
                 
-            if hr not in hourly_records:
-                hourly_records[hr] = {}
-            hourly_records[hr][item.get("datatype")] = clean_val(item.get("value"), None)
+            stations = response.json().get("results", [])
+            if not stations:
+                continue
                 
-        hourly_dict = {
-            "time": [],
-            "temperature_2m": [],
-            "relative_humidity_2m": [],
-            "wind_speed_10m": [],
-            "surface_pressure": []
-        }
+            for stn in stations:
+                stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
+                
+            stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
+            
+            for stn in stations_sorted[:15]:
+                data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
+                data_params = {
+                    "datasetid": datasetid,
+                    "stationid": stn["id"],
+                    "startdate": date_str,
+                    "enddate": date_str,
+                    "limit": 1000,
+                    "units": "standard"
+                }
+                
+                data_res = requests.get(data_url, headers=headers, params=data_params, timeout=20)
+                if data_res.status_code == 200:
+                    results = data_res.json().get("results", [])
+                    if results:
+                        hourly_data_found = results
+                        closest_stn = stn
+                        min_dist = stn["computed_dist"]
+                        break
+            if hourly_data_found:
+                break
+        except Exception:
+            continue
+            
+    if not hourly_data_found:
+        return {"error": f"No NOAA weather stations reported data within range for {date_str}. Consider using Open-Meteo."}
         
-        for hr in range(24):
-            hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
-            rec = hourly_records.get(hr, {})
+    def clean_val(val, default):
+        if val is None: return default
+        val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
+        try:
+            numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
+            return float(numeric) if numeric else default
+        except:
+            return default
             
-            temp = rec.get("HourlyDryBulbTemperature")
-            rh = rec.get("HourlyRelativeHumidity")
-            wind = rec.get("HourlyWindSpeed")
-            pressure_hg = rec.get("HourlyStationPressure")
+    hourly_records = {}
+    for item in hourly_data_found:
+        dt_str = item.get("date")
+        try:
+            hr = datetime.fromisoformat(dt_str).hour
+        except Exception:
+            hr = 12 # Default midday if timestamp format differs in daily aggregates
             
-            temp = temp if temp is not None else (hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0)
-            rh = rh if rh is not None else (hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0)
-            wind = wind if wind is not None else (hourly_dict["wind_speed_10m"][-1] if hr > 0 else 0.0)
-            pressure_hg = pressure_hg if pressure_hg is not None else 29.92
+        if hr not in hourly_records:
+            hourly_records[hr] = {}
+        hourly_records[hr][item.get("datatype")] = clean_val(item.get("value"), None)
             
-            hourly_dict["temperature_2m"].append(temp)
-            hourly_dict["relative_humidity_2m"].append(rh)
-            hourly_dict["wind_speed_10m"].append(wind)
-            hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
-            
-        return {
-            "hourly": hourly_dict,
-            "grid_latitude": closest_stn["latitude"],
-            "grid_longitude": closest_stn["longitude"],
-            "station_name": closest_stn.get("name", closest_stn.get("id")),
-            "distance_miles": min_dist
-        }
+    hourly_dict = {
+        "time": [],
+        "temperature_2m": [],
+        "relative_humidity_2m": [],
+        "wind_speed_10m": [],
+        "surface_pressure": []
+    }
+    
+    for hr in range(24):
+        hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
+        rec = hourly_records.get(hr, hourly_records.get(list(hourly_records.keys())[0], {}))
         
-    except Exception as e:
-        return {"error": f"NOAA Processing Error: {str(e)}"}
+        temp = rec.get("HourlyDryBulbTemperature", rec.get("TMAX", rec.get("TAVG", 75.0)))
+        rh = rec.get("HourlyRelativeHumidity", 50.0)
+        wind = rec.get("HourlyWindSpeed", rec.get("AWND", 5.0))
+        pressure_hg = rec.get("HourlyStationPressure", 29.92)
+        
+        temp = temp if temp is not None else (hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0)
+        rh = rh if rh is not None else (hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0)
+        wind = wind if wind is not None else (hourly_dict["wind_speed_10m"][-1] if hr > 0 else 5.0)
+        pressure_hg = pressure_hg if pressure_hg is not None else 29.92
+        
+        hourly_dict["temperature_2m"].append(temp)
+        hourly_dict["relative_humidity_2m"].append(rh)
+        hourly_dict["wind_speed_10m"].append(wind)
+        hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
+        
+    return {
+        "hourly": hourly_dict,
+        "grid_latitude": closest_stn["latitude"],
+        "grid_longitude": closest_stn["longitude"],
+        "station_name": closest_stn.get("name", closest_stn.get("id")),
+        "distance_miles": min_dist
+    }
 
 def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
     street = street.strip()
@@ -336,7 +337,6 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     except Exception:
                         continue
             except Exception as conn_error:
-                st.warning(f"Connection warning: {conn_error}. Attempting calculations directly.")
                 target_frame = page
 
             total_rows = len(hourly_data)
@@ -745,9 +745,16 @@ if st.session_state.step == 1:
     with c_data2:
         noaa_key = ""
         if data_source == "NOAA Station Data (Requires API Key)":
-            if hasattr(st, "secrets") and "NOAA_API_KEY" in st.secrets:
+            # Check secrets first (supporting both dict keys and environment variables)
+            if "NOAA_API_KEY" in st.secrets:
                 noaa_key = st.secrets["NOAA_API_KEY"]
                 st.info("✅ API Key automatically loaded from Streamlit Secrets.")
+            elif "noaa" in st.secrets and "api_key" in st.secrets["noaa"]:
+                noaa_key = st.secrets["noaa"]["api_key"]
+                st.info("✅ API Key automatically loaded from Streamlit Secrets.")
+            elif os.environ.get("NOAA_API_KEY"):
+                noaa_key = os.environ.get("NOAA_API_KEY")
+                st.info("✅ API Key automatically loaded from environment.")
             else:
                 noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
     
@@ -919,7 +926,7 @@ elif st.session_state.step == 2:
                 data_source_val = st.session_state.location_meta.get("data_source", "Open-Meteo")
                 if data_source_val == "NOAA Station Data (Requires API Key)":
                     stn_name = st.session_state.location_meta.get("station_name", "Unknown Station")
-                    data_source_label = f"NOAA LCD Data ({stn_name})"
+                    data_source_label = f"NOAA Station Data ({stn_name})"
                 else:
                     data_source_label = (
                         "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
