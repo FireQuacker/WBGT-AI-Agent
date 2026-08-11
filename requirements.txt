@@ -1,10 +1,8 @@
 streamlit
-playwright==1.49.0
-pydantic
-matplotlib
-numpy
 pandas
+numpy
 requests
-openpyxl
-seaborn
+matplotlib
 plotly
+scipy
+openpyxl
