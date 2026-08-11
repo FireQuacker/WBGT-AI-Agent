@@ -143,13 +143,13 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    extent = f"{lat-1.0},{lon-1.0},{lat+1.0},{lon+1.0}"
+    # Expanded search extent to roughly 2.5 degrees to catch regional weather observation stations
+    extent = f"{lat-2.5},{lon-2.5},{lat+2.5},{lon+2.5}"
     date_str = target_date.strftime("%Y-%m-%d")
     start_iso = f"{date_str}T00:00:00"
     end_iso = f"{date_str}T23:59:59"
     
-    # Strictly prioritize LCD for hourly metrics. Only fall back to GHCND if truly necessary, but validate datatypes.
-    datasets = ["LCD", "GHCND"]
+    datasets = ["LCD", "GHCND", "ANNUAL", "PRECIP_HLY"]
     hourly_data_found = None
     closest_stn = None
     min_dist = float('inf')
@@ -159,7 +159,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
         params = {
             "extent": extent,
-            "limit": 100,
+            "limit": 250,
             "datasetid": datasetid
         }
         try:
@@ -176,7 +176,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 
             stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
             
-            for stn in stations_sorted[:15]:
+            for stn in stations_sorted[:25]:
                 data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
                 data_params = {
                     "datasetid": datasetid,
@@ -191,14 +191,11 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 if data_res.status_code == 200:
                     results = data_res.json().get("results", [])
                     if results:
-                        # Validate if this dataset actually contains hourly/temperature fields, otherwise keep looking
-                        has_hourly_metrics = any(item.get("datatype") in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity"] for item in results)
-                        if datasetid == "LCD" or has_hourly_metrics:
-                            hourly_data_found = results
-                            closest_stn = stn
-                            min_dist = stn["computed_dist"]
-                            used_dataset = datasetid
-                            break
+                        hourly_data_found = results
+                        closest_stn = stn
+                        min_dist = stn["computed_dist"]
+                        used_dataset = datasetid
+                        break
             if hourly_data_found:
                 break
         except Exception:
@@ -237,8 +234,8 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
 
     for hr in range(24):
         target_dt = datetime.combine(target_date_obj, datetime.min.time()) + timedelta(hours=hr)
-        window_start = target_dt - timedelta(minutes=10)
-        window_end = target_dt + timedelta(minutes=10)
+        window_start = target_dt - timedelta(minutes=60)  # Expanded window matcher to 60 mins for robust station alignment
+        window_end = target_dt + timedelta(minutes=60)
         
         candidates = []
         for dt_str, metrics in raw_obs_by_time.items():
@@ -253,7 +250,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 obs_dt = datetime.fromisoformat(clean_dt_str)
                 
                 if window_start <= obs_dt <= window_end:
-                    completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity", "HourlyWindSpeed", "AWND", "HourlyStationPressure"] if metrics.get(d) is not None)
+                    completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity", "HourlyWindSpeed", "AWND", "HourlyStationPressure", "PRCP"] if metrics.get(d) is not None)
                     time_diff_sec = abs((obs_dt - target_dt).total_seconds())
                     candidates.append({
                         "dt_str": dt_str,
@@ -357,7 +354,7 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12
     rh = rh_pct
     tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) 
           + math.atan(tc + rh) 
-          - math.atan(rh - 1.676331) 
+          + math.atan(rh - 1.676331) 
           + 0.00391838 * (rh)**1.5 * math.atan(0.023101 * rh) 
           - 4.686035)
     
@@ -831,13 +828,10 @@ if st.session_state.step == 1:
         if data_source == "NOAA Station Data (Requires API Key)":
             if "NOAA_API_KEY" in st.secrets:
                 noaa_key = st.secrets["NOAA_API_KEY"]
-                st.info("✅ API Key automatically loaded from Streamlit Secrets.")
             elif "noaa" in st.secrets and "api_key" in st.secrets["noaa"]:
                 noaa_key = st.secrets["noaa"]["api_key"]
-                st.info("✅ API Key automatically loaded from Streamlit Secrets.")
             elif os.environ.get("NOAA_API_KEY"):
                 noaa_key = os.environ.get("NOAA_API_KEY")
-                st.info("✅ API Key automatically loaded from environment.")
             else:
                 noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
     
@@ -901,7 +895,7 @@ elif st.session_state.step == 2:
     
     if st.session_state.raw_weather_debug:
         with st.expander("🔍 Raw NOAA / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
-            st.markdown("Inspect this data to verify how the +/- 10-minute window matching selected timestamps around each top-of-the-hour mark:")
+            st.markdown("Inspect this data to verify how the window matching selected timestamps around each top-of-the-hour mark:")
             st.json(st.session_state.raw_weather_debug)
             
             if st.session_state.final_hourly_rows:
