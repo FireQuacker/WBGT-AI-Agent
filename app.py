@@ -141,14 +141,14 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    # Shrink bounding box from 2.0 degrees to ~20 miles to prevent API timeouts
-    extent = f"{lat-0.15},{lon-0.15},{lat+0.15},{lon+0.15}"
+    # Expanded bounding box to ~35 miles (0.5 degrees) to hit major regional hubs
+    extent = f"{lat-0.5},{lon-0.5},{lat+0.5},{lon+0.5}"
     date_str = target_date.strftime("%Y-%m-%d")
     
     url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
     params = {
         "extent": extent,
-        "limit": 50,
+        "limit": 150,  # Increased limit to ensure we don't miss the primary airport
         "datasetid": "LCD"
     }
     
@@ -159,7 +159,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             
         stations = response.json().get("results", [])
         if not stations:
-            return {"error": f"No NOAA LCD stations found within a 20-mile radius for {date_str}. Consider using Open-Meteo."}
+            return {"error": f"No NOAA LCD stations found within a 35-mile radius for {date_str}. Consider using Open-Meteo."}
             
         for stn in stations:
             stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
@@ -170,8 +170,8 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         closest_stn = None
         min_dist = float('inf')
         
-        # Limit the data request to the 5 closest stations to reduce latency
-        for stn in stations_sorted[:5]:
+        # Test up to the 10 closest stations to find one actually reporting hourly data
+        for stn in stations_sorted[:10]:
             data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
             data_params = {
                 "datasetid": "LCD",
@@ -194,7 +194,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         if not hourly_data_found:
             return {"error": f"No nearby stations reported hourly Local Climatological Data for {date_str}."}
             
-        # Clean NOAA's legacy string flags (e.g., '72s', 'V', '*') to pure floats
         def clean_val(val, default):
             if val is None: return default
             val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
@@ -228,7 +227,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
             rec = hourly_records.get(hr, {})
             
-            # Extract and fallback to previous hour if data point is missing
             temp = rec.get("HourlyDryBulbTemperature")
             rh = rec.get("HourlyRelativeHumidity")
             wind = rec.get("HourlyWindSpeed")
@@ -701,7 +699,7 @@ with st.expander("📚 Methodology, Data Sources & About the Author"):
     Bringing over 20 years of foundational nursing experience to his role alongside a prominent background as a Compliance Safety and Health Officer (CSHO), Andre bridges the critical operational gap between clinical health sciences and practical, on-the-ground occupational safety. As an established process improvement specialist, data scientist, and AI developer, he is deeply dedicated to engineering modernized, high-efficiency regulatory tools that empower safety professionals to better protect worker health.
     """)
 
-mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", ""))
+mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", "") if hasattr(st, "secrets") else "")
 
 if st.session_state.pending_geo is not None:
     show_location_confirmation_dialog()
@@ -747,7 +745,11 @@ if st.session_state.step == 1:
     with c_data2:
         noaa_key = ""
         if data_source == "NOAA Station Data (Requires API Key)":
-            noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
+            if hasattr(st, "secrets") and "NOAA_API_KEY" in st.secrets:
+                noaa_key = st.secrets["NOAA_API_KEY"]
+                st.info("✅ API Key automatically loaded from Streamlit Secrets.")
+            else:
+                noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
     
     if st.session_state.is_forecast and data_source == "NOAA Station Data (Requires API Key)":
         st.warning("⚠️ NOAA Historical Station Data cannot be used for future predictions. Please switch to Open-Meteo or change to a historical date.")
