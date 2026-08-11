@@ -141,13 +141,14 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    extent = f"{lat-1.0},{lon-1.0},{lat+1.0},{lon+1.0}"
+    # Shrink bounding box from 2.0 degrees to ~20 miles to prevent API timeouts
+    extent = f"{lat-0.15},{lon-0.15},{lat+0.15},{lon+0.15}"
     date_str = target_date.strftime("%Y-%m-%d")
     
     url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
     params = {
         "extent": extent,
-        "limit": 1000,
+        "limit": 50,
         "datasetid": "LCD"
     }
     
@@ -156,11 +157,9 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         if response.status_code != 200:
             return {"error": f"NOAA Station API Error (HTTP {response.status_code}). Please verify your token."}
             
-        data = response.json()
-        stations = data.get("results", [])
-            
+        stations = response.json().get("results", [])
         if not stations:
-            return {"error": f"No NOAA LCD stations found within vicinity for {date_str}. Consider using Open-Meteo."}
+            return {"error": f"No NOAA LCD stations found within a 20-mile radius for {date_str}. Consider using Open-Meteo."}
             
         for stn in stations:
             stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
@@ -171,12 +170,12 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         closest_stn = None
         min_dist = float('inf')
         
-        for stn in stations_sorted[:15]:
-            station_id = stn["id"]
+        # Limit the data request to the 5 closest stations to reduce latency
+        for stn in stations_sorted[:5]:
             data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
             data_params = {
                 "datasetid": "LCD",
-                "stationid": station_id,
+                "stationid": stn["id"],
                 "startdate": date_str,
                 "enddate": date_str,
                 "limit": 1000,
@@ -185,8 +184,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             
             data_res = requests.get(data_url, headers=headers, params=data_params, timeout=20)
             if data_res.status_code == 200:
-                data_json = data_res.json()
-                results = data_json.get("results", [])
+                results = data_res.json().get("results", [])
                 if results:
                     hourly_data_found = results
                     closest_stn = stn
@@ -194,22 +192,9 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                     break
                     
         if not hourly_data_found:
-            return {"error": f"No nearby stations reported hourly Local Climatological Data (LCD) for {date_str}. Consider using Open-Meteo."}
+            return {"error": f"No nearby stations reported hourly Local Climatological Data for {date_str}."}
             
-        hourly_records = {}
-        for item in hourly_data_found:
-            dt_str = item.get("date")
-            try:
-                dt = datetime.fromisoformat(dt_str)
-                hr = dt.hour
-            except Exception:
-                continue
-            if hr not in hourly_records:
-                hourly_records[hr] = {}
-            dtype = item.get("datatype")
-            val = item.get("value")
-            hourly_records[hr][dtype] = val
-            
+        # Clean NOAA's legacy string flags (e.g., '72s', 'V', '*') to pure floats
         def clean_val(val, default):
             if val is None: return default
             val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
@@ -218,6 +203,18 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 return float(numeric) if numeric else default
             except:
                 return default
+                
+        hourly_records = {}
+        for item in hourly_data_found:
+            dt_str = item.get("date")
+            try:
+                hr = datetime.fromisoformat(dt_str).hour
+            except Exception:
+                continue
+                
+            if hr not in hourly_records:
+                hourly_records[hr] = {}
+            hourly_records[hr][item.get("datatype")] = clean_val(item.get("value"), None)
                 
         hourly_dict = {
             "time": [],
@@ -231,10 +228,11 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
             rec = hourly_records.get(hr, {})
             
-            temp = clean_val(rec.get("HourlyDryBulbTemperature"), None)
-            rh = clean_val(rec.get("HourlyRelativeHumidity"), None)
-            wind = clean_val(rec.get("HourlyWindSpeed"), None)
-            pressure_hg = clean_val(rec.get("HourlyStationPressure"), None)
+            # Extract and fallback to previous hour if data point is missing
+            temp = rec.get("HourlyDryBulbTemperature")
+            rh = rec.get("HourlyRelativeHumidity")
+            wind = rec.get("HourlyWindSpeed")
+            pressure_hg = rec.get("HourlyStationPressure")
             
             temp = temp if temp is not None else (hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0)
             rh = rh if rh is not None else (hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0)
