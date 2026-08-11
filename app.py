@@ -143,7 +143,6 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    # Expanded search extent to roughly 2.5 degrees to catch regional weather observation stations
     extent = f"{lat-2.5},{lon-2.5},{lat+2.5},{lon+2.5}"
     date_str = target_date.strftime("%Y-%m-%d")
     start_iso = f"{date_str}T00:00:00"
@@ -234,7 +233,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
 
     for hr in range(24):
         target_dt = datetime.combine(target_date_obj, datetime.min.time()) + timedelta(hours=hr)
-        window_start = target_dt - timedelta(minutes=60)  # Expanded window matcher to 60 mins for robust station alignment
+        window_start = target_dt - timedelta(minutes=60)
         window_end = target_dt + timedelta(minutes=60)
         
         candidates = []
