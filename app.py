@@ -143,8 +143,10 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    extent = f"{lat-0.8},{lon-0.8},{lat+0.8},{lon+0.8}"
+    extent = f"{lat-1.0},{lon-1.0},{lat+1.0},{lon+1.0}"
     date_str = target_date.strftime("%Y-%m-%d")
+    start_iso = f"{date_str}T00:00:00"
+    end_iso = f"{date_str}T23:59:59"
     
     datasets = ["LCD", "GHCND"]
     hourly_data_found = None
@@ -156,7 +158,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
         params = {
             "extent": extent,
-            "limit": 150,
+            "limit": 100,
             "datasetid": datasetid
         }
         try:
@@ -178,8 +180,8 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 data_params = {
                     "datasetid": datasetid,
                     "stationid": stn["id"],
-                    "startdate": date_str,
-                    "enddate": date_str,
+                    "startdate": start_iso,
+                    "enddate": end_iso,
                     "limit": 1000,
                     "units": "standard"
                 }
@@ -209,20 +211,77 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             return float(numeric) if numeric else default
         except:
             return default
-            
-    hourly_records = {}
+
+    # Group raw observations by exact timestamp string first
+    raw_obs_by_time = {}
+    all_datatypes_present = set()
+    
     for item in hourly_data_found:
         dt_str = item.get("date")
-        try:
-            dt_parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            hr = dt_parsed.hour
-        except Exception:
-            hr = 12 
-            
-        if hr not in hourly_records:
+        if not dt_str:
+            continue
+        if dt_str not in raw_obs_by_time:
+            raw_obs_by_time[dt_str] = {}
+        dtype = item.get("datatype")
+        val = clean_val(item.get("value"), None)
+        raw_obs_by_time[dt_str][dtype] = val
+        if dtype:
+            all_datatypes_present.add(dtype)
+
+    # +/- 10 minute window matching logic per hour (0 to 23)
+    hourly_records = {}
+    match_mapping_log = {}
+
+    target_date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    for hr in range(24):
+        # Construct target top-of-hour datetime (treating NOAA times as local station time / LST)
+        target_dt = datetime.combine(target_date_obj, datetime.min.time()) + timedelta(hours=hr)
+        window_start = target_dt - timedelta(minutes=10)
+        window_end = target_dt + timedelta(minutes=10)
+        
+        candidates = []
+        for dt_str, metrics in raw_obs_by_time.items():
+            try:
+                # Clean Z or timezone offsets for parsing comparison
+                clean_dt_str = dt_str.replace("Z", "")
+                if "+" in clean_dt_str[10:]:
+                    clean_dt_str = clean_dt_str.split("+")[0]
+                elif "-" in clean_dt_str[10:]:
+                    parts = clean_dt_str.split("-")
+                    clean_dt_str = "-".join(parts[:3])
+                
+                obs_dt = datetime.fromisoformat(clean_dt_str)
+                
+                if window_start <= obs_dt <= window_end:
+                    # Count how many critical meteorological metrics are non-null in this observation
+                    completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity", "HourlyWindSpeed", "AWND", "HourlyStationPressure"] if metrics.get(d) is not None)
+                    # Absolute distance from top of the hour in seconds
+                    time_diff_sec = abs((obs_dt - target_dt).total_seconds())
+                    candidates.append({
+                        "dt_str": dt_str,
+                        "obs_dt": obs_dt,
+                        "metrics": metrics,
+                        "completeness": completeness_score,
+                        "time_diff_sec": time_diff_sec
+                    })
+            except Exception:
+                continue
+                
+        if candidates:
+            # Sort: 1. Highest completeness score descending, 2. Closest time difference ascending
+            candidates.sort(key=lambda x: (-x["completeness"], x["time_diff_sec"]))
+            best_match = candidates[0]
+            hourly_records[hr] = best_match["metrics"]
+            match_mapping_log[hr] = {
+                "matched_noaa_timestamp": best_match["dt_str"],
+                "offset_minutes": round(best_match["time_diff_sec"] / 60.0, 1),
+                "completeness_score": best_match["completeness"]
+            }
+        else:
             hourly_records[hr] = {}
-        hourly_records[hr][item.get("datatype")] = clean_val(item.get("value"), None)
-            
+            match_mapping_log[hr] = {"matched_noaa_timestamp": None, "offset_minutes": None, "completeness_score": 0}
+
     hourly_dict = {
         "time": [],
         "temperature_2m": [],
@@ -266,6 +325,8 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             "station_info": closest_stn,
             "dataset_queried": used_dataset,
             "raw_api_results_count": len(hourly_data_found),
+            "datatypes_found_in_dataset": list(all_datatypes_present),
+            "window_matching_log": match_mapping_log,
             "raw_api_results_sample": hourly_data_found[:30],
             "parsed_hourly_records_map": hourly_records
         }
@@ -651,7 +712,6 @@ def show_location_confirmation_dialog():
                 if "dataset_used" in weather_res:
                     st.session_state.location_meta["dataset_used"] = weather_res["dataset_used"]
                     
-                # Save raw debug payload for diagnostics
                 st.session_state.raw_weather_debug = weather_res.get("raw_debug", None)
                 
                 active_rows = []
@@ -659,9 +719,17 @@ def show_location_confirmation_dialog():
                     hr_int = int(hourly["time"][i].split("T")[1].split(":")[0])
                     if start_hour <= hr_int <= end_hour:
                         ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
+                        
+                        # Capture NOAA matching metadata if available
+                        noaa_log = st.session_state.raw_weather_debug.get("window_matching_log", {}) if st.session_state.raw_weather_debug else {}
+                        hour_match_info = noaa_log.get(hr_int, {})
+                        matched_ts = hour_match_info.get("matched_noaa_timestamp", "N/A")
+                        
                         active_rows.append({
                             "date_string_final": target_date.strftime("%m/%d/%Y"), 
-                            "time_display": ampm, "hour_24h": hr_int,
+                            "time_display": ampm, 
+                            "hour_24h": hr_int,
+                            "noaa_matched_timestamp": matched_ts,
                             "user_entered_address": geo["raw_entered"],
                             "validated_address": geo["matched_address"],
                             "latitude": geo["latitude"], "longitude": geo["longitude"],
@@ -840,12 +908,12 @@ elif st.session_state.step == 2:
     # --- DIAGNOSTIC EXPANDER FOR RAW WEATHER DATA ---
     if st.session_state.raw_weather_debug:
         with st.expander("🔍 Raw NOAA / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
-            st.markdown("Inspect this data to see if the NOAA API returned flat / identical metrics for every hour or if parsing translation caused the repetition.")
+            st.markdown("Inspect this data to verify how the +/- 10-minute window matching selected timestamps around each top-of-the-hour mark:")
             st.json(st.session_state.raw_weather_debug)
             
             if st.session_state.final_hourly_rows:
-                st.markdown("**Parsed Hourly Values Fed to OSHA Calculator:**")
-                debug_df = pd.DataFrame(st.session_state.final_hourly_rows)[["time_display", "temperature_f", "relative_humidity_percent", "wind_speed_mph", "barometric_pressure_inhg"]]
+                st.markdown("**Parsed Hourly Values & NOAA Source Timestamp Fed to OSHA Calculator:**")
+                debug_df = pd.DataFrame(st.session_state.final_hourly_rows)[["time_display", "noaa_matched_timestamp", "temperature_f", "relative_humidity_percent", "wind_speed_mph", "barometric_pressure_inhg"]]
                 st.dataframe(debug_df, use_container_width=True)
     
     st.markdown("### Heat Stress Standard")
