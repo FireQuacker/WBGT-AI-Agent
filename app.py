@@ -149,7 +149,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         "extent": extent,
         "startdate": date_str,
         "enddate": date_str,
-        "limit": 100,
+        "limit": 1000,
         "datasetid": "GHCND"
     }
     
@@ -163,18 +163,24 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         if not stations:
             return {"error": "No active NOAA stations found within vicinity (~69 miles) for this specific date."}
             
-        # Calculate true distances to find the best nearby matching candidates
         for stn in stations:
             stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
             
         stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
         
+        # Filter for likely LCD candidates (USW = Weather Bureau Army Navy, usually airports)
+        # These are much more likely to have hourly data than USC (cooperative) stations
+        candidate_stations = [s for s in stations_sorted if s["id"].startswith("GHCND:USW")]
+        
+        # Fallback to all stations if no USW stations are found in the radius
+        if not candidate_stations:
+            candidate_stations = stations_sorted
+        
         df = None
         closest_stn = None
         min_dist = float('inf')
         
-        # Iterate over up to 25 closest stations to verify actual LCD hourly data is present
-        for stn in stations_sorted[:25]:
+        for stn in candidate_stations[:25]:
             station_id_raw = stn["id"]
             station_clean = station_id_raw.split(":")[-1]
             
@@ -191,7 +197,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             data_res = requests.get(data_url, params=data_params, timeout=20)
             if data_res.status_code == 200 and data_res.text.strip():
                 temp_df = pd.read_csv(io.StringIO(data_res.text), low_memory=False)
-                # Check for empty and verify it carries the Hourly metrics we require
                 if not temp_df.empty and 'HourlyDryBulbTemperature' in temp_df.columns:
                     df = temp_df
                     closest_stn = stn
@@ -203,7 +208,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             
         df['DATE'] = pd.to_datetime(df['DATE'])
         
-        # Helper to aggressively strip trailing NOAA specific markers (*, s, V)
         def clean_val(val, default):
             if pd.isna(val): return default
             val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
@@ -240,8 +244,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 hourly_dict["temperature_2m"].append(temp)
                 hourly_dict["relative_humidity_2m"].append(rh)
                 hourly_dict["wind_speed_10m"].append(wind)
-                
-                # Note: App framework multiples surface pressure natively by 0.02953, so convert inHg to hPa initially.
                 hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
             else:
                 prev_temp = hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0
@@ -581,6 +583,12 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
 @st.dialog("Confirm Target Location")
 def show_location_confirmation_dialog():
     geo = st.session_state.pending_geo
+    
+    # Prevents Streamlit from throwing a TypeError if the user clicks 
+    # 'Edit Location' and clears the state while the dialog is still rendering.
+    if not geo: 
+        return
+        
     st.write("Please confirm that the retrieved location matches your intended site before proceeding:")
     
     col_entered, col_matched = st.columns(2)
@@ -621,7 +629,6 @@ def show_location_confirmation_dialog():
                 grid_lat = weather_res["grid_latitude"]
                 grid_lon = weather_res["grid_longitude"]
                 
-                # Depending on the source, determine distance dynamically from point or station
                 if "distance_miles" in weather_res:
                     dist_miles = weather_res["distance_miles"]
                 else:
