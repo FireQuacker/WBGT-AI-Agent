@@ -148,7 +148,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
     params = {
         "extent": extent,
         "limit": 1000,
-        "datasetid": "GHCND"
+        "datasetid": "LCD"
     }
     
     try:
@@ -160,50 +160,58 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         stations = data.get("results", [])
             
         if not stations:
-            return {"error": f"No NOAA stations found within vicinity (~69 miles) for {date_str}. Try switching to Open-Meteo for complete historical reanalysis coverage."}
+            return {"error": f"No NOAA LCD stations found within vicinity for {date_str}. Consider using Open-Meteo."}
             
         for stn in stations:
             stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
             
         stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
-        candidate_stations = [s for s in stations_sorted if s["id"].startswith("GHCND:USW")]
-        if not candidate_stations:
-            candidate_stations = stations_sorted
         
-        df = None
+        hourly_data_found = None
         closest_stn = None
         min_dist = float('inf')
         
-        for stn in candidate_stations[:25]:
-            station_id_raw = stn["id"]
-            station_clean = station_id_raw.split(":")[-1]
-            
-            data_url = "https://www.ncei.noaa.gov/access/services/data/v1"
+        for stn in stations_sorted[:15]:
+            station_id = stn["id"]
+            data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
             data_params = {
-                "dataset": "local-climatological-data",
-                "stations": station_clean,
-                "startDate": date_str,
-                "endDate": date_str,
-                "format": "csv",
-                "includeAttributes": "false"
+                "datasetid": "LCD",
+                "stationid": station_id,
+                "startdate": date_str,
+                "enddate": date_str,
+                "limit": 1000,
+                "units": "standard"
             }
             
-            data_res = requests.get(data_url, params=data_params, timeout=20)
-            if data_res.status_code == 200 and data_res.text.strip():
-                temp_df = pd.read_csv(io.StringIO(data_res.text), low_memory=False)
-                if not temp_df.empty and 'HourlyDryBulbTemperature' in temp_df.columns:
-                    df = temp_df
+            data_res = requests.get(data_url, headers=headers, params=data_params, timeout=20)
+            if data_res.status_code == 200:
+                data_json = data_res.json()
+                results = data_json.get("results", [])
+                if results:
+                    hourly_data_found = results
                     closest_stn = stn
                     min_dist = stn["computed_dist"]
                     break
                     
-        if df is None or df.empty:
+        if not hourly_data_found:
             return {"error": f"No nearby stations reported hourly Local Climatological Data (LCD) for {date_str}. Consider using Open-Meteo."}
             
-        df['DATE'] = pd.to_datetime(df['DATE'])
-        
+        hourly_records = {}
+        for item in hourly_data_found:
+            dt_str = item.get("date")
+            try:
+                dt = datetime.fromisoformat(dt_str)
+                hr = dt.hour
+            except Exception:
+                continue
+            if hr not in hourly_records:
+                hourly_records[hr] = {}
+            dtype = item.get("datatype")
+            val = item.get("value")
+            hourly_records[hr][dtype] = val
+            
         def clean_val(val, default):
-            if pd.isna(val): return default
+            if val is None: return default
             val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
             try:
                 numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
@@ -219,37 +227,25 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             "surface_pressure": []
         }
         
-        df['hour'] = df['DATE'].dt.hour
         for hr in range(24):
             hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
-            hr_df = df[df['hour'] == hr]
+            rec = hourly_records.get(hr, {})
             
-            if not hr_df.empty:
-                temp = hr_df.get('HourlyDryBulbTemperature', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
-                rh = hr_df.get('HourlyRelativeHumidity', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
-                wind = hr_df.get('HourlyWindSpeed', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
-                pressure_hg = hr_df.get('HourlyStationPressure', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
-                
-                temp = temp if pd.notna(temp) else 75.0
-                rh = rh if pd.notna(rh) else 50.0
-                wind = wind if pd.notna(wind) else 0.0
-                pressure_hg = pressure_hg if pd.notna(pressure_hg) else 29.92
-                
-                hourly_dict["temperature_2m"].append(temp)
-                hourly_dict["relative_humidity_2m"].append(rh)
-                hourly_dict["wind_speed_10m"].append(wind)
-                hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
-            else:
-                prev_temp = hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0
-                prev_rh = hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0
-                prev_wind = hourly_dict["wind_speed_10m"][-1] if hr > 0 else 0.0
-                prev_pres = hourly_dict["surface_pressure"][-1] if hr > 0 else (29.92 / 0.02953)
-                
-                hourly_dict["temperature_2m"].append(prev_temp)
-                hourly_dict["relative_humidity_2m"].append(prev_rh)
-                hourly_dict["wind_speed_10m"].append(prev_wind)
-                hourly_dict["surface_pressure"].append(prev_pres)
-                
+            temp = clean_val(rec.get("HourlyDryBulbTemperature"), None)
+            rh = clean_val(rec.get("HourlyRelativeHumidity"), None)
+            wind = clean_val(rec.get("HourlyWindSpeed"), None)
+            pressure_hg = clean_val(rec.get("HourlyStationPressure"), None)
+            
+            temp = temp if temp is not None else (hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0)
+            rh = rh if rh is not None else (hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0)
+            wind = wind if wind is not None else (hourly_dict["wind_speed_10m"][-1] if hr > 0 else 0.0)
+            pressure_hg = pressure_hg if pressure_hg is not None else 29.92
+            
+            hourly_dict["temperature_2m"].append(temp)
+            hourly_dict["relative_humidity_2m"].append(rh)
+            hourly_dict["wind_speed_10m"].append(wind)
+            hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
+            
         return {
             "hourly": hourly_dict,
             "grid_latitude": closest_stn["latitude"],
