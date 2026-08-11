@@ -42,6 +42,8 @@ if "pending_geo" not in st.session_state:
     st.session_state.pending_geo = None
 if "final_hourly_rows" not in st.session_state:
     st.session_state.final_hourly_rows = None
+if "raw_weather_debug" not in st.session_state:
+    st.session_state.raw_weather_debug = None
 if "worker_weight" not in st.session_state:
     st.session_state.worker_weight = 154.0
 if "fallback_active" not in st.session_state:
@@ -65,8 +67,7 @@ if "location_meta" not in st.session_state:
 # GEOCODING & METEOROLOGICAL UTILITIES
 # =====================================================================
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculates the great-circle distance between two points in miles using the Haversine formula."""
-    R = 3958.8  # Earth radius in miles
+    R = 3958.8  
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
@@ -134,21 +135,22 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
         return {
             "hourly": data.get("hourly", {}),
             "grid_latitude": data.get("latitude", lat),
-            "grid_longitude": data.get("longitude", lon)
+            "grid_longitude": data.get("longitude", lon),
+            "raw_debug": data
         }
     except Exception as e:
         return {"error": f"Weather System Error: {str(e)}"}
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    extent = f"{lat-0.6},{lon-0.6},{lat+0.6},{lon+0.6}"
+    extent = f"{lat-0.8},{lon-0.8},{lat+0.8},{lon+0.8}"
     date_str = target_date.strftime("%Y-%m-%d")
     
-    # Try LCD dataset first, then fall back to GHCND/GSOM if hourly logs are missing
     datasets = ["LCD", "GHCND"]
     hourly_data_found = None
     closest_stn = None
     min_dist = float('inf')
+    used_dataset = None
     
     for datasetid in datasets:
         url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
@@ -189,6 +191,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                         hourly_data_found = results
                         closest_stn = stn
                         min_dist = stn["computed_dist"]
+                        used_dataset = datasetid
                         break
             if hourly_data_found:
                 break
@@ -211,9 +214,10 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
     for item in hourly_data_found:
         dt_str = item.get("date")
         try:
-            hr = datetime.fromisoformat(dt_str).hour
+            dt_parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            hr = dt_parsed.hour
         except Exception:
-            hr = 12 # Default midday if timestamp format differs in daily aggregates
+            hr = 12 
             
         if hr not in hourly_records:
             hourly_records[hr] = {}
@@ -227,31 +231,44 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         "surface_pressure": []
     }
     
+    last_temp = 75.0
+    last_rh = 50.0
+    last_wind = 5.0
+    last_pres = 29.92 * 0.02953
+    
     for hr in range(24):
         hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
-        rec = hourly_records.get(hr, hourly_records.get(list(hourly_records.keys())[0], {}))
+        rec = hourly_records.get(hr, {})
         
-        temp = rec.get("HourlyDryBulbTemperature", rec.get("TMAX", rec.get("TAVG", 75.0)))
-        rh = rec.get("HourlyRelativeHumidity", 50.0)
-        wind = rec.get("HourlyWindSpeed", rec.get("AWND", 5.0))
-        pressure_hg = rec.get("HourlyStationPressure", 29.92)
+        temp = rec.get("HourlyDryBulbTemperature", rec.get("TMAX", rec.get("TAVG", None)))
+        rh = rec.get("HourlyRelativeHumidity", None)
+        wind = rec.get("HourlyWindSpeed", rec.get("AWND", None))
+        pressure_hg = rec.get("HourlyStationPressure", None)
         
-        temp = temp if temp is not None else (hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0)
-        rh = rh if rh is not None else (hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0)
-        wind = wind if wind is not None else (hourly_dict["wind_speed_10m"][-1] if hr > 0 else 5.0)
-        pressure_hg = pressure_hg if pressure_hg is not None else 29.92
+        if temp is not None: last_temp = temp
+        if rh is not None: last_rh = rh
+        if wind is not None: last_wind = wind
+        if pressure_hg is not None: last_pres = pressure_hg
         
-        hourly_dict["temperature_2m"].append(temp)
-        hourly_dict["relative_humidity_2m"].append(rh)
-        hourly_dict["wind_speed_10m"].append(wind)
-        hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
+        hourly_dict["temperature_2m"].append(last_temp)
+        hourly_dict["relative_humidity_2m"].append(last_rh)
+        hourly_dict["wind_speed_10m"].append(last_wind)
+        hourly_dict["surface_pressure"].append((last_pres if pressure_hg is not None else 29.92) / 0.02953)
         
     return {
         "hourly": hourly_dict,
         "grid_latitude": closest_stn["latitude"],
         "grid_longitude": closest_stn["longitude"],
         "station_name": closest_stn.get("name", closest_stn.get("id")),
-        "distance_miles": min_dist
+        "dataset_used": used_dataset,
+        "distance_miles": min_dist,
+        "raw_debug": {
+            "station_info": closest_stn,
+            "dataset_queried": used_dataset,
+            "raw_api_results_count": len(hourly_data_found),
+            "raw_api_results_sample": hourly_data_found[:30],
+            "parsed_hourly_records_map": hourly_records
+        }
     }
 
 def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
@@ -336,7 +353,7 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                         break
                     except Exception:
                         continue
-            except Exception as conn_error:
+            except Exception:
                 target_frame = page
 
             total_rows = len(hourly_data)
@@ -631,6 +648,11 @@ def show_location_confirmation_dialog():
                 
                 if "station_name" in weather_res:
                     st.session_state.location_meta["station_name"] = weather_res["station_name"]
+                if "dataset_used" in weather_res:
+                    st.session_state.location_meta["dataset_used"] = weather_res["dataset_used"]
+                    
+                # Save raw debug payload for diagnostics
+                st.session_state.raw_weather_debug = weather_res.get("raw_debug", None)
                 
                 active_rows = []
                 for i in range(len(hourly["time"])):
@@ -745,7 +767,6 @@ if st.session_state.step == 1:
     with c_data2:
         noaa_key = ""
         if data_source == "NOAA Station Data (Requires API Key)":
-            # Check secrets first (supporting both dict keys and environment variables)
             if "NOAA_API_KEY" in st.secrets:
                 noaa_key = st.secrets["NOAA_API_KEY"]
                 st.info("✅ API Key automatically loaded from Streamlit Secrets.")
@@ -815,6 +836,17 @@ if st.session_state.step == 1:
 # --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
+    
+    # --- DIAGNOSTIC EXPANDER FOR RAW WEATHER DATA ---
+    if st.session_state.raw_weather_debug:
+        with st.expander("🔍 Raw NOAA / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
+            st.markdown("Inspect this data to see if the NOAA API returned flat / identical metrics for every hour or if parsing translation caused the repetition.")
+            st.json(st.session_state.raw_weather_debug)
+            
+            if st.session_state.final_hourly_rows:
+                st.markdown("**Parsed Hourly Values Fed to OSHA Calculator:**")
+                debug_df = pd.DataFrame(st.session_state.final_hourly_rows)[["time_display", "temperature_f", "relative_humidity_percent", "wind_speed_mph", "barometric_pressure_inhg"]]
+                st.dataframe(debug_df, use_container_width=True)
     
     st.markdown("### Heat Stress Standard")
     standard_choice = st.radio(
@@ -1029,6 +1061,7 @@ elif st.session_state.step == 3:
         st.session_state.step = 1
         st.session_state.pending_geo = None
         st.session_state.final_hourly_rows = None
+        st.session_state.raw_weather_debug = None
         st.session_state.fallback_active = False
         st.session_state.location_fallback = False
         st.session_state.use_caf = False
