@@ -119,6 +119,152 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
     except Exception as e:
         return {"error": f"Mapbox Fallback System Error: {str(e)}"}
 
+def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: bool) -> dict:
+    url = "https://api.open-meteo.com/v1/forecast" if is_forecast else "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
+        "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
+        "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "timezone": "auto"
+    }
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            return {"error": f"Weather API blocked the request (HTTP {response.status_code})."}
+        data = response.json()
+        return {
+            "hourly": data.get("hourly", {}),
+            "grid_latitude": data.get("latitude", lat),
+            "grid_longitude": data.get("longitude", lon)
+        }
+    except Exception as e:
+        return {"error": f"Weather System Error: {str(e)}"}
+
+def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
+    headers = {"token": token}
+    extent = f"{lat-0.5},{lon-0.5},{lat+0.5},{lon+0.5}"
+    date_str = target_date.strftime("%Y-%m-%d")
+    
+    url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
+    params = {
+        "extent": extent,
+        "startdate": date_str,
+        "enddate": date_str,
+        "limit": 100,
+        "datasetid": "GHCND"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        if response.status_code != 200:
+            return {"error": f"NOAA Station API Error (HTTP {response.status_code}). Please verify your token."}
+            
+        data = response.json()
+        stations = data.get("results", [])
+        if not stations:
+            return {"error": "No active NOAA stations found within vicinity (~35 miles) for this specific date."}
+            
+        # Calculate true distances to find the best nearby matching candidates
+        for stn in stations:
+            stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
+            
+        stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
+        
+        df = None
+        closest_stn = None
+        min_dist = float('inf')
+        
+        # Iterate over up to 5 closest stations to verify actual LCD hourly data is present
+        for stn in stations_sorted[:5]:
+            station_id_raw = stn["id"]
+            station_clean = station_id_raw.split(":")[-1]
+            
+            data_url = "https://www.ncei.noaa.gov/access/services/data/v1"
+            data_params = {
+                "dataset": "local-climatological-data",
+                "stations": station_clean,
+                "startDate": date_str,
+                "endDate": date_str,
+                "format": "csv",
+                "includeAttributes": "false"
+            }
+            
+            data_res = requests.get(data_url, params=data_params, timeout=20)
+            if data_res.status_code == 200 and data_res.text.strip():
+                temp_df = pd.read_csv(io.StringIO(data_res.text), low_memory=False)
+                # Check for empty and verify it carries the Hourly metrics we require
+                if not temp_df.empty and 'HourlyDryBulbTemperature' in temp_df.columns:
+                    df = temp_df
+                    closest_stn = stn
+                    min_dist = stn["computed_dist"]
+                    break
+                    
+        if df is None or df.empty:
+            return {"error": f"No nearby stations reported hourly Local Climatological Data (LCD) for {date_str}."}
+            
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        
+        # Helper to aggressively strip trailing NOAA specific markers (*, s, V)
+        def clean_val(val, default):
+            if pd.isna(val): return default
+            val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
+            try:
+                numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
+                return float(numeric) if numeric else default
+            except:
+                return default
+                
+        hourly_dict = {
+            "time": [],
+            "temperature_2m": [],
+            "relative_humidity_2m": [],
+            "wind_speed_10m": [],
+            "surface_pressure": []
+        }
+        
+        df['hour'] = df['DATE'].dt.hour
+        for hr in range(24):
+            hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
+            hr_df = df[df['hour'] == hr]
+            
+            if not hr_df.empty:
+                temp = hr_df.get('HourlyDryBulbTemperature', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
+                rh = hr_df.get('HourlyRelativeHumidity', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
+                wind = hr_df.get('HourlyWindSpeed', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
+                pressure_hg = hr_df.get('HourlyStationPressure', pd.Series(dtype=float)).apply(lambda x: clean_val(x, None)).dropna().mean()
+                
+                temp = temp if pd.notna(temp) else 75.0
+                rh = rh if pd.notna(rh) else 50.0
+                wind = wind if pd.notna(wind) else 0.0
+                pressure_hg = pressure_hg if pd.notna(pressure_hg) else 29.92
+                
+                hourly_dict["temperature_2m"].append(temp)
+                hourly_dict["relative_humidity_2m"].append(rh)
+                hourly_dict["wind_speed_10m"].append(wind)
+                
+                # Note: App framework multiples surface pressure natively by 0.02953, so convert inHg to hPa initially.
+                hourly_dict["surface_pressure"].append(pressure_hg / 0.02953)
+            else:
+                prev_temp = hourly_dict["temperature_2m"][-1] if hr > 0 else 75.0
+                prev_rh = hourly_dict["relative_humidity_2m"][-1] if hr > 0 else 50.0
+                prev_wind = hourly_dict["wind_speed_10m"][-1] if hr > 0 else 0.0
+                prev_pres = hourly_dict["surface_pressure"][-1] if hr > 0 else (29.92 / 0.02953)
+                
+                hourly_dict["temperature_2m"].append(prev_temp)
+                hourly_dict["relative_humidity_2m"].append(prev_rh)
+                hourly_dict["wind_speed_10m"].append(prev_wind)
+                hourly_dict["surface_pressure"].append(prev_pres)
+                
+        return {
+            "hourly": hourly_dict,
+            "grid_latitude": closest_stn["latitude"],
+            "grid_longitude": closest_stn["longitude"],
+            "station_name": closest_stn.get("name", closest_stn.get("id")),
+            "distance_miles": min_dist
+        }
+        
+    except Exception as e:
+        return {"error": f"NOAA Processing Error: {str(e)}"}
+
 def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
     street = street.strip()
     city = city.strip()
@@ -142,26 +288,6 @@ def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_k
             return res2, True, general_address
             
     return {"error": "Location coordinates could not be resolved. Please verify City, State, and ZIP Code."}, False, exact_address or general_address
-
-def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: bool) -> dict:
-    url = "https://api.open-meteo.com/v1/forecast" if is_forecast else "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
-        "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
-        "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "timezone": "auto"
-    }
-    try:
-        response = requests.get(url, params=params)
-        if response.status_code != 200:
-            return {"error": f"Weather API blocked the request (HTTP {response.status_code})."}
-        data = response.json()
-        return {
-            "hourly": data.get("hourly", {}),
-            "grid_latitude": data.get("latitude", lat),
-            "grid_longitude": data.get("longitude", lon)
-        }
-    except Exception as e:
-        return {"error": f"Weather System Error: {str(e)}"}
 
 def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12, is_sun=True):
     tc = (temp_f - 32) * 5.0 / 9.0
@@ -481,15 +607,25 @@ def show_location_confirmation_dialog():
             worker_weight = geo["worker_weight"]
             
             date_str = target_date.strftime("%Y-%m-%d")
-            weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
+            
+            with st.spinner("Retrieving atmospheric matrices from data provider..."):
+                if geo.get("data_source") == "NOAA Station Data (Requires API Key)":
+                    weather_res = fetch_weather_noaa_pipeline(geo["latitude"], geo["longitude"], target_date, geo["noaa_key"])
+                else:
+                    weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
             
             if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]:
-                st.error("Could not pull valid weather timeline matrices for this date/location.")
+                st.error(weather_res.get("error", "Could not pull valid weather timeline matrices for this date/location."))
             else:
                 hourly = weather_res["hourly"]
                 grid_lat = weather_res["grid_latitude"]
                 grid_lon = weather_res["grid_longitude"]
-                dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
+                
+                # Depending on the source, determine distance dynamically from point or station
+                if "distance_miles" in weather_res:
+                    dist_miles = weather_res["distance_miles"]
+                else:
+                    dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
                 
                 st.session_state.location_meta = {
                     "user_entered": geo["raw_entered"],
@@ -498,8 +634,12 @@ def show_location_confirmation_dialog():
                     "target_lon": geo["longitude"],
                     "grid_lat": grid_lat,
                     "grid_lon": grid_lon,
-                    "distance_miles": dist_miles
+                    "distance_miles": dist_miles,
+                    "data_source": geo.get("data_source", "Open-Meteo")
                 }
+                
+                if "station_name" in weather_res:
+                    st.session_state.location_meta["station_name"] = weather_res["station_name"]
                 
                 active_rows = []
                 for i in range(len(hourly["time"])):
@@ -607,47 +747,68 @@ if st.session_state.step == 1:
     with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
     with c_shift3: worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
+    st.markdown("**Meteorological Data Provider**")
+    c_data1, c_data2 = st.columns([2, 2])
+    with c_data1:
+        data_source = st.radio("Select Provider:", ["Open-Meteo (Default/Free)", "NOAA Station Data (Requires API Key)"])
+    with c_data2:
+        noaa_key = ""
+        if data_source == "NOAA Station Data (Requires API Key)":
+            noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
+    
+    if st.session_state.is_forecast and data_source == "NOAA Station Data (Requires API Key)":
+        st.warning("⚠️ NOAA Historical Station Data cannot be used for future predictions. Please switch to Open-Meteo or change to a historical date.")
+        
     button_text = "Fetch Forecasted Weather Data" if st.session_state.is_forecast else "Fetch Historical Weather Data"
     
     if st.button(button_text, type="primary"):
-        if use_gps:
-            try:
-                lat_val = float(target_lat_in)
-                lon_val = float(target_lon_in)
-                st.session_state.pending_geo = {
-                    "latitude": lat_val,
-                    "longitude": lon_val,
-                    "matched_address": f"Exact Coordinates ({lat_val}, {lon_val})",
-                    "raw_entered": f"GPS: {lat_val}, {lon_val}",
-                    "fallback_used": False,
-                    "target_date": target_date,
-                    "shift_hours": (start_hour, end_hour),
-                    "worker_weight": worker_weight
-                }
-                st.rerun()
-            except ValueError:
-                st.error("Please enter valid numerical values for Latitude and Longitude.")
+        if st.session_state.is_forecast and data_source == "NOAA Station Data (Requires API Key)":
+            st.error("Cannot use NOAA Station Data for future forecasts.")
+        elif data_source == "NOAA Station Data (Requires API Key)" and not noaa_key.strip():
+            st.error("NOAA API Token is required when NOAA Station Data is selected.")
         else:
-            if not target_city.strip() and not target_zip.strip() and not target_street.strip():
-                st.warning("Please supply at least a City/State, ZIP Code, or Street Address.")
+            if use_gps:
+                try:
+                    lat_val = float(target_lat_in)
+                    lon_val = float(target_lon_in)
+                    st.session_state.pending_geo = {
+                        "latitude": lat_val,
+                        "longitude": lon_val,
+                        "matched_address": f"Exact Coordinates ({lat_val}, {lon_val})",
+                        "raw_entered": f"GPS: {lat_val}, {lon_val}",
+                        "fallback_used": False,
+                        "target_date": target_date,
+                        "shift_hours": (start_hour, end_hour),
+                        "worker_weight": worker_weight,
+                        "data_source": data_source,
+                        "noaa_key": noaa_key
+                    }
+                    st.rerun()
+                except ValueError:
+                    st.error("Please enter valid numerical values for Latitude and Longitude.")
             else:
-                with st.spinner("Resolving location coordinates..."):
-                    geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
-                    
-                    if "error" in geo:
-                        st.error(geo["error"])
-                    else:
-                        st.session_state.pending_geo = {
-                            "latitude": geo["latitude"],
-                            "longitude": geo["longitude"],
-                            "matched_address": geo.get("matched_address", raw_entered_address),
-                            "raw_entered": raw_entered_address,
-                            "fallback_used": fallback_used and bool(target_street.strip()),
-                            "target_date": target_date,
-                            "shift_hours": (start_hour, end_hour),
-                            "worker_weight": worker_weight
-                        }
-                        st.rerun()
+                if not target_city.strip() and not target_zip.strip() and not target_street.strip():
+                    st.warning("Please supply at least a City/State, ZIP Code, or Street Address.")
+                else:
+                    with st.spinner("Resolving location coordinates..."):
+                        geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
+                        
+                        if "error" in geo:
+                            st.error(geo["error"])
+                        else:
+                            st.session_state.pending_geo = {
+                                "latitude": geo["latitude"],
+                                "longitude": geo["longitude"],
+                                "matched_address": geo.get("matched_address", raw_entered_address),
+                                "raw_entered": raw_entered_address,
+                                "fallback_used": fallback_used and bool(target_street.strip()),
+                                "target_date": target_date,
+                                "shift_hours": (start_hour, end_hour),
+                                "worker_weight": worker_weight,
+                                "data_source": data_source,
+                                "noaa_key": noaa_key
+                            }
+                            st.rerun()
 
 # --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
 elif st.session_state.step == 2:
@@ -760,11 +921,16 @@ elif st.session_state.step == 2:
                     row["final_watts"] = round(calc_watts, 1)
                 
             with st.spinner("Executing calculations..."):
-                data_source_label = (
-                    "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
-                    if st.session_state.is_forecast 
-                    else "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
-                )
+                data_source_val = st.session_state.location_meta.get("data_source", "Open-Meteo")
+                if data_source_val == "NOAA Station Data (Requires API Key)":
+                    stn_name = st.session_state.location_meta.get("station_name", "Unknown Station")
+                    data_source_label = f"NOAA LCD Data ({stn_name})"
+                else:
+                    data_source_label = (
+                        "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
+                        if st.session_state.is_forecast 
+                        else "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
+                    )
                 results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
                 
             if results:
@@ -783,12 +949,16 @@ elif st.session_state.step == 3:
         
     meta = st.session_state.get("location_meta", {})
     if meta:
+        station_info = ""
+        if "station_name" in meta:
+            station_info = f"\n* **NOAA Weather Station:** {meta.get('station_name')}"
+            
         st.info(
             f"📍 **Address Audit Trail:**\n"
             f"* **Entered Location:** {meta.get('user_entered', 'N/A')}\n"
             f"* **Validated/Geocoded Location:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})\n"
-            f"* **Open-Meteo Grid Point:** Lat {meta.get('grid_lat')}, Lon {meta.get('grid_lon')}\n"
-            f"* **Distance to Weather Data Grid Point:** **{meta.get('distance_miles', 0.0):.2f} miles**"
+            f"* **Weather Point:** Lat {meta.get('grid_lat')}, Lon {meta.get('grid_lon')}{station_info}\n"
+            f"* **Distance to Weather Data Point:** **{meta.get('distance_miles', 0.0):.2f} miles**"
         )
         
     fig = generate_compliance_plot(
