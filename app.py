@@ -148,6 +148,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
     start_iso = f"{date_str}T00:00:00"
     end_iso = f"{date_str}T23:59:59"
     
+    # Strictly prioritize LCD for hourly metrics. Only fall back to GHCND if truly necessary, but validate datatypes.
     datasets = ["LCD", "GHCND"]
     hourly_data_found = None
     closest_stn = None
@@ -190,18 +191,21 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 if data_res.status_code == 200:
                     results = data_res.json().get("results", [])
                     if results:
-                        hourly_data_found = results
-                        closest_stn = stn
-                        min_dist = stn["computed_dist"]
-                        used_dataset = datasetid
-                        break
+                        # Validate if this dataset actually contains hourly/temperature fields, otherwise keep looking
+                        has_hourly_metrics = any(item.get("datatype") in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity"] for item in results)
+                        if datasetid == "LCD" or has_hourly_metrics:
+                            hourly_data_found = results
+                            closest_stn = stn
+                            min_dist = stn["computed_dist"]
+                            used_dataset = datasetid
+                            break
             if hourly_data_found:
                 break
         except Exception:
             continue
             
     if not hourly_data_found:
-        return {"error": f"No NOAA weather stations reported data within range for {date_str}. Consider using Open-Meteo."}
+        return {"error": f"No NOAA weather stations reported hourly data within range for {date_str}. Consider using Open-Meteo."}
         
     def clean_val(val, default):
         if val is None: return default
@@ -212,7 +216,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         except:
             return default
 
-    # Group raw observations by exact timestamp string first
     raw_obs_by_time = {}
     all_datatypes_present = set()
     
@@ -228,14 +231,11 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         if dtype:
             all_datatypes_present.add(dtype)
 
-    # +/- 10 minute window matching logic per hour (0 to 23)
     hourly_records = {}
     match_mapping_log = {}
-
     target_date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
 
     for hr in range(24):
-        # Construct target top-of-hour datetime (treating NOAA times as local station time / LST)
         target_dt = datetime.combine(target_date_obj, datetime.min.time()) + timedelta(hours=hr)
         window_start = target_dt - timedelta(minutes=10)
         window_end = target_dt + timedelta(minutes=10)
@@ -243,7 +243,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         candidates = []
         for dt_str, metrics in raw_obs_by_time.items():
             try:
-                # Clean Z or timezone offsets for parsing comparison
                 clean_dt_str = dt_str.replace("Z", "")
                 if "+" in clean_dt_str[10:]:
                     clean_dt_str = clean_dt_str.split("+")[0]
@@ -254,9 +253,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 obs_dt = datetime.fromisoformat(clean_dt_str)
                 
                 if window_start <= obs_dt <= window_end:
-                    # Count how many critical meteorological metrics are non-null in this observation
                     completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity", "HourlyWindSpeed", "AWND", "HourlyStationPressure"] if metrics.get(d) is not None)
-                    # Absolute distance from top of the hour in seconds
                     time_diff_sec = abs((obs_dt - target_dt).total_seconds())
                     candidates.append({
                         "dt_str": dt_str,
@@ -269,7 +266,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 continue
                 
         if candidates:
-            # Sort: 1. Highest completeness score descending, 2. Closest time difference ascending
             candidates.sort(key=lambda x: (-x["completeness"], x["time_diff_sec"]))
             best_match = candidates[0]
             hourly_records[hr] = best_match["metrics"]
@@ -720,7 +716,6 @@ def show_location_confirmation_dialog():
                     if start_hour <= hr_int <= end_hour:
                         ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
                         
-                        # Capture NOAA matching metadata if available
                         noaa_log = st.session_state.raw_weather_debug.get("window_matching_log", {}) if st.session_state.raw_weather_debug else {}
                         hour_match_info = noaa_log.get(hr_int, {})
                         matched_ts = hour_match_info.get("matched_noaa_timestamp", "N/A")
@@ -770,7 +765,6 @@ else:
 st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
 st.divider()
 
-# --- METHODOLOGY & ABOUT EXPANDER ---
 with st.expander("📚 Methodology, Data Sources & About the Author"):
     st.markdown("""
     ### 📍 Address Matching & Geocoding Pipeline
@@ -905,7 +899,6 @@ if st.session_state.step == 1:
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
-    # --- DIAGNOSTIC EXPANDER FOR RAW WEATHER DATA ---
     if st.session_state.raw_weather_debug:
         with st.expander("🔍 Raw NOAA / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
             st.markdown("Inspect this data to verify how the +/- 10-minute window matching selected timestamps around each top-of-the-hour mark:")
