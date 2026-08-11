@@ -7,3 +7,4 @@ pandas
 requests
 openpyxl
 seaborn
+plotly
