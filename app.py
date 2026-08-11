@@ -142,7 +142,7 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
         return {"error": f"Weather System Error: {str(e)}"}
 
 # =====================================================================
-# STRICT NOAA LCD-ONLY PIPELINE (GHCND BLOCKED)
+# STRICT NOAA LCD-ONLY PIPELINE (OPTIMIZED TIMEOUT & ERROR HANDLING)
 # =====================================================================
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
@@ -151,7 +151,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
     start_iso = f"{date_str}T00:00:00"
     end_iso = f"{date_str}T23:59:59"
     
-    # Strictly limit dataset scope to LCD to completely block GHCND
     datasetid = "LCD"
     base_url = "https://www.ncdc.noaa.gov/cdo-api/v2/"
     
@@ -164,15 +163,15 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         stations_params = {
             "datasetid": datasetid,
             "extent": extent,
-            "limit": 250
+            "limit": 100
         }
-        res = requests.get(stations_url, headers=headers, params=stations_params, timeout=15)
+        res = requests.get(stations_url, headers=headers, params=stations_params, timeout=30)
+        
         if res.status_code == 200:
             stations = res.json().get("results", [])
             valid_stations = []
             for stn in stations:
                 stn_id = stn.get("id", "")
-                # Guardrail: Explicitly bypass GHCND stations
                 if "GHCND" in stn_id.upper():
                     continue
                 stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
@@ -180,7 +179,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 
             valid_stations = sorted(valid_stations, key=lambda x: x["computed_dist"])
             
-            for stn in valid_stations[:15]:
+            for stn in valid_stations[:10]:
                 data_url = f"{base_url}data"
                 data_params = {
                     "datasetid": datasetid,
@@ -190,19 +189,27 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                     "limit": 1000,
                     "units": "standard"
                 }
-                data_res = requests.get(data_url, headers=headers, params=data_params, timeout=20)
-                if data_res.status_code == 200:
-                    results = data_res.json().get("results", [])
-                    if results:
-                        hourly_data_found = results
-                        closest_stn = stn
-                        min_dist = stn["computed_dist"]
-                        break
+                try:
+                    data_res = requests.get(data_url, headers=headers, params=data_params, timeout=30)
+                    if data_res.status_code == 200:
+                        results = data_res.json().get("results", [])
+                        if results:
+                            hourly_data_found = results
+                            closest_stn = stn
+                            min_dist = stn["computed_dist"]
+                            break
+                except requests.exceptions.Timeout:
+                    continue
+        else:
+            return {"error": f"NOAA Stations API returned status code {res.status_code}. Token may be invalid or rate-limited."}
+            
+    except requests.exceptions.Timeout:
+        return {"error": "NOAA CDO API connection timed out (30s limit reached). NOAA servers are currently experiencing high latency."}
     except Exception as e:
-        return {"error": f"NOAA LCD Pipeline Error: {str(e)}"}
+        return {"error": f"NOAA LCD Pipeline Exception: {str(e)}"}
         
     if not hourly_data_found or not closest_stn:
-        return {"error": f"No valid NOAA LCD stations reported hourly records within range for {date_str}. (GHCND fallback is disabled). Consider using Open-Meteo."}
+        return {"error": f"No valid NOAA LCD stations reported hourly records within range for {date_str} before timeout."}
         
     def clean_val(val, default):
         if val is None: return default
