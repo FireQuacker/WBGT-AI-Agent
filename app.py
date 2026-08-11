@@ -160,19 +160,25 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             
         data = response.json()
         stations = data.get("results", [])
+        
+        # Fallback expansion if exact date query returns no stations
         if not stations:
-            return {"error": "No active NOAA stations found within vicinity (~69 miles) for this specific date."}
+            alt_start = (target_date - timedelta(days=1)).strftime("%Y-%m-%d")
+            alt_end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            params["startdate"] = alt_start
+            params["enddate"] = alt_end
+            response_alt = requests.get(url, headers=headers, params=params, timeout=15)
+            if response_alt.status_code == 200:
+                stations = response_alt.json().get("results", [])
+                
+        if not stations:
+            return {"error": f"No active NOAA stations found within vicinity (~69 miles) for {date_str}. Try switching to Open-Meteo for complete historical reanalysis coverage."}
             
         for stn in stations:
             stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
             
         stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
-        
-        # Filter for likely LCD candidates (USW = Weather Bureau Army Navy, usually airports)
-        # These are much more likely to have hourly data than USC (cooperative) stations
         candidate_stations = [s for s in stations_sorted if s["id"].startswith("GHCND:USW")]
-        
-        # Fallback to all stations if no USW stations are found in the radius
         if not candidate_stations:
             candidate_stations = stations_sorted
         
@@ -204,7 +210,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                     break
                     
         if df is None or df.empty:
-            return {"error": f"No nearby stations reported hourly Local Climatological Data (LCD) for {date_str}."}
+            return {"error": f"No nearby stations reported hourly Local Climatological Data (LCD) for {date_str}. Consider using Open-Meteo."}
             
         df['DATE'] = pd.to_datetime(df['DATE'])
         
@@ -584,8 +590,6 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
 def show_location_confirmation_dialog():
     geo = st.session_state.pending_geo
     
-    # Prevents Streamlit from throwing a TypeError if the user clicks 
-    # 'Edit Location' and clears the state while the dialog is still rendering.
     if not geo: 
         return
         
@@ -983,26 +987,21 @@ elif st.session_state.step == 3:
     df_results = pd.DataFrame(st.session_state.results)
     st.dataframe(df_results, use_container_width=True)
     
-    # Parse date from metrics matrix for correct report filename labeling
     if st.session_state.results:
         raw_exposure_date = st.session_state.results[0]["Date"]
         file_date_str = datetime.strptime(raw_exposure_date, "%m/%d/%Y").strftime("%Y%m%d")
     else:
         file_date_str = datetime.now().strftime("%Y%m%d")
     
-    # Render Matplotlib figure to an in-memory PNG buffer for spreadsheet embedding
     img_buffer = io.BytesIO()
     fig.savefig(img_buffer, format="png", bbox_inches="tight", dpi=150)
     img_buffer.seek(0)
     
-    # Generate Multi-Tab Excel Document with Embedded Graphic Chart
     excel_buffer = io.BytesIO()
     
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        # Sheet 1: Hourly Exposure Matrix Data
         df_results.to_excel(writer, sheet_name="Exposure_Data", index=False)
         
-        # Sheet 2: Site Location & Meteorological Audit Trail
         meta_df = pd.DataFrame([{
             "User_Entered_Address": meta.get("user_entered", "N/A"),
             "Validated_Address": meta.get("validated", "N/A"),
@@ -1014,7 +1013,6 @@ elif st.session_state.step == 3:
         }])
         meta_df.to_excel(writer, sheet_name="Location_Details", index=False)
         
-        # Access openpyxl workbook structure to embed image onto Exposure_Data tab
         workbook = writer.book
         exposure_sheet = writer.sheets["Exposure_Data"]
         
@@ -1022,7 +1020,6 @@ elif st.session_state.step == 3:
         excel_img.width = 650
         excel_img.height = 380
         
-        # Position graphic image neatly below the results matrix
         insert_row = len(df_results) + 4
         exposure_sheet.add_image(excel_img, f"A{insert_row}")
         
