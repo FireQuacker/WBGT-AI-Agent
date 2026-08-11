@@ -1,8 +1,8 @@
 streamlit
-pandas
-numpy
-requests
+playwright==1.49.0
+pydantic
 matplotlib
-plotly
-scipy
+numpy
+pandas
+requests
 openpyxl
