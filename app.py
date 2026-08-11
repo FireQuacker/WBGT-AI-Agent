@@ -1,22 +1,6 @@
 import os
 import subprocess
 import streamlit as st
-
-# =====================================================================
-# ONE-TIME PLAYWRIGHT INSTALLER (PREVENTS RE-RUN LAG)
-# =====================================================================
-@st.cache_resource
-def install_browser_engine():
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=True)
-    except Exception as e:
-        st.error(f"Background browser engine initialization warning: {e}")
-
-install_browser_engine()
-
-# =====================================================================
-# APPLICATION IMPORTS
-# =====================================================================
 import time
 import math
 import io
@@ -30,6 +14,18 @@ import numpy as np
 import pandas as pd
 import openpyxl
 from openpyxl.drawing.image import Image as OpenPyxlImage
+
+# =====================================================================
+# ONE-TIME PLAYWRIGHT INSTALLER (PREVENTS RE-RUN LAG)
+# =====================================================================
+@st.cache_resource
+def install_browser_engine():
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        st.error(f"Background browser engine initialization warning: {e}")
+
+install_browser_engine()
 
 # =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
@@ -128,7 +124,7 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
         "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "timezone": "auto"
     }
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=15)
         if response.status_code != 200:
             return {"error": f"Weather API blocked the request (HTTP {response.status_code})."}
         data = response.json()
@@ -165,7 +161,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             "extent": extent,
             "limit": 100
         }
-        res = requests.get(stations_url, headers=headers, params=stations_params, timeout=30)
+        res = requests.get(stations_url, headers=headers, params=stations_params, timeout=10)
         
         if res.status_code == 200:
             stations = res.json().get("results", [])
@@ -179,7 +175,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 
             valid_stations = sorted(valid_stations, key=lambda x: x["computed_dist"])
             
-            for stn in valid_stations[:10]:
+            for stn in valid_stations[:3]:
                 data_url = f"{base_url}data"
                 data_params = {
                     "datasetid": datasetid,
@@ -190,7 +186,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                     "units": "standard"
                 }
                 try:
-                    data_res = requests.get(data_url, headers=headers, params=data_params, timeout=30)
+                    data_res = requests.get(data_url, headers=headers, params=data_params, timeout=7)
                     if data_res.status_code == 200:
                         results = data_res.json().get("results", [])
                         if results:
@@ -204,7 +200,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             return {"error": f"NOAA Stations API returned status code {res.status_code}. Token may be invalid or rate-limited."}
             
     except requests.exceptions.Timeout:
-        return {"error": "NOAA CDO API connection timed out (30s limit reached). NOAA servers are currently experiencing high latency."}
+        return {"error": "NOAA CDO API connection timed out. NOAA servers are currently experiencing high latency."}
     except Exception as e:
         return {"error": f"NOAA LCD Pipeline Exception: {str(e)}"}
         
@@ -217,7 +213,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         try:
             numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
             return float(numeric) if numeric else default
-        except:
+        except ValueError:
             return default
 
     raw_obs_by_time = {}
@@ -425,15 +421,22 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 row_fallback = False
                 sun_f, shade_f = 0.0, 0.0
                 
-                orig_temp, orig_rh, orig_ws, orig_pres = float(hour['temperature_f']), int(hour['relative_humidity_percent']), float(hour['wind_speed_mph']), float(hour['barometric_pressure_inhg'])
-                safe_temp, safe_rh, safe_ws, safe_pres = max(min(orig_temp, 120.0), 32.0), max(min(orig_rh, 100), 1), max(min(orig_ws, 50.0), 0.0), max(min(orig_pres, 32.0), 25.0)
+                orig_temp = float(hour['temperature_f'])
+                orig_rh = int(hour['relative_humidity_percent'])
+                orig_ws = float(hour['wind_speed_mph'])
+                orig_pres = float(hour['barometric_pressure_inhg'])
+                
+                safe_temp = max(min(orig_temp, 120.0), 32.0)
+                safe_rh = max(min(orig_rh, 100), 1)
+                safe_ws = max(min(orig_ws, 50.0), 0.0)
+                safe_pres = max(min(orig_pres, 32.0), 25.0)
 
                 notes_list = []
                 if orig_temp < 32.0: notes_list.append("Air Temp rounded up to 32.0 °F")
                 elif orig_temp > 120.0: notes_list.append("Air Temp rounded down to 120.0 °F")
                 if orig_rh < 1: notes_list.append("RH rounded up to 1%")
                 elif orig_rh > 100: notes_list.append("RH rounded down to 100%")
-                if st.session_state.location_fallback: notes_list.append("City/State/Zip were used as exact location could not be resolved")
+                if st.session_state.location_fallback: notes_list.append("City/State/Zip used (exact location unresolved)")
                 if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
                 
                 notes_str = " | ".join(notes_list) if notes_list else "None"
@@ -450,8 +453,10 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     target_frame.locator('input[name="ws"]').fill(str(safe_ws))
                     target_frame.locator('input[name="pres"]').fill(str(safe_pres))
                     
-                    try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
-                    except Exception: pass
+                    try: 
+                        target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
+                    except Exception: 
+                        pass
                     
                     time.sleep(0.1)
                     target_frame.locator('input[value="Submit"]').click()
@@ -468,7 +473,8 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     if "/" in sun_wbgt:
                         sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip())
                         shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip())
-                    else: row_fallback = True
+                    else: 
+                        row_fallback = True
                 except Exception:
                     row_fallback = True
                 
@@ -490,8 +496,10 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 alert_f = round((alert_c * 1.8) + 32, 1)
                 
                 status = "Normal"
-                if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
-                elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
+                if sun_f > limit_f or shade_f > limit_f: 
+                    status = f"BREACH: {limit_name}"
+                elif sun_f > alert_f or shade_f > alert_f: 
+                    status = f"WARNING: {alert_name}"
                 
                 row_dict = {
                     "Date": hour["date_string_final"],
@@ -519,8 +527,11 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
         st.session_state.fallback_active = True
         computed_results = []
         for index, hour in enumerate(hourly_data):
-            orig_temp, orig_rh, orig_ws = float(hour['temperature_f']), int(hour['relative_humidity_percent']), float(hour['wind_speed_mph'])
+            orig_temp = float(hour['temperature_f'])
+            orig_rh = int(hour['relative_humidity_percent'])
+            orig_ws = float(hour['wind_speed_mph'])
             orig_pres = float(hour['barometric_pressure_inhg'])
+            
             sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour['hour_24h'], is_sun=True)
             shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour['hour_24h'], is_sun=False)
             
@@ -529,7 +540,7 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 shade_f = round(shade_f + st.session_state.caf_value, 1)
             
             notes_list = []
-            if st.session_state.location_fallback: notes_list.append("City/State/Zip were used as exact location could not be resolved")
+            if st.session_state.location_fallback: notes_list.append("City/State/Zip used (exact location unresolved)")
             if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
             notes_list.append("Offline Stull Fallback Used")
             notes_str = " | ".join(notes_list)
@@ -541,8 +552,10 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
             alert_f = round((alert_c * 1.8) + 32, 1)
             
             status = "Normal"
-            if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
-            elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
+            if sun_f > limit_f or shade_f > limit_f: 
+                status = f"BREACH: {limit_name}"
+            elif sun_f > alert_f or shade_f > alert_f: 
+                status = f"WARNING: {alert_name}"
             
             row_dict = {
                 "Date": hour["date_string_final"],
@@ -679,7 +692,7 @@ def show_location_confirmation_dialog():
             date_str = target_date.strftime("%Y-%m-%d")
             
             with st.spinner("Retrieving atmospheric matrices from data provider..."):
-                if geo.get("data_source") == "NOAA Station Data (Requires API Key)":
+                if "NOAA" in geo.get("data_source", ""):
                     weather_res = fetch_weather_noaa_pipeline(geo["latitude"], geo["longitude"], target_date, geo["noaa_key"])
                 else:
                     weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
@@ -736,8 +749,10 @@ def show_location_confirmation_dialog():
                             "grid_distance_miles": dist_miles,
                             "longitude_absolute": abs(geo["longitude"]), 
                             "tz_value": get_osha_tz_value(geo["longitude"]),
-                            "temperature_f": hourly["temperature_2m"][i], "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
-                            "wind_speed_mph": hourly["wind_speed_10m"][i], "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
+                            "temperature_f": hourly["temperature_2m"][i], 
+                            "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
+                            "wind_speed_mph": hourly["wind_speed_10m"][i], 
+                            "barometric_pressure_inhg": round(hourly["surface_pressure"][i] * 0.02953, 2)
                         })
                 
                 st.session_state.final_hourly_rows = active_rows
@@ -827,10 +842,11 @@ if st.session_state.step == 1:
     st.markdown("**Meteorological Data Provider**")
     c_data1, c_data2 = st.columns([2, 2])
     with c_data1:
-        data_source = st.radio("Select Provider:", ["Open-Meteo (Default/Free)", "NOAA Station Data (Requires API Key)"])
+        data_source = st.radio("Select Provider:", ["Open-Meteo (Default/Free)", "NOAA Station Data (Requires API Key) [UNDER CONSTRUCTION]"])
+        noaa_selected = "UNDER CONSTRUCTION" in data_source
     with c_data2:
         noaa_key = ""
-        if data_source == "NOAA Station Data (Requires API Key)":
+        if "NOAA" in data_source:
             if "NOAA_API_KEY" in st.secrets:
                 noaa_key = st.secrets["NOAA_API_KEY"]
             elif "noaa" in st.secrets and "api_key" in st.secrets["noaa"]:
@@ -840,15 +856,15 @@ if st.session_state.step == 1:
             else:
                 noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
     
-    if st.session_state.is_forecast and data_source == "NOAA Station Data (Requires API Key)":
+    if st.session_state.is_forecast and "NOAA" in data_source:
         st.warning("⚠️ NOAA Historical Station Data cannot be used for future predictions. Please switch to Open-Meteo or change to a historical date.")
         
     button_text = "Fetch Forecasted Weather Data" if st.session_state.is_forecast else "Fetch Historical Weather Data"
     
-    if st.button(button_text, type="primary"):
-        if st.session_state.is_forecast and data_source == "NOAA Station Data (Requires API Key)":
+    if st.button(button_text, type="primary", disabled=noaa_selected):
+        if st.session_state.is_forecast and "NOAA" in data_source:
             st.error("Cannot use NOAA Station Data for future forecasts.")
-        elif data_source == "NOAA Station Data (Requires API Key)" and not noaa_key.strip():
+        elif "NOAA" in data_source and not noaa_key.strip():
             st.error("NOAA API Token is required when NOAA Station Data is selected.")
         else:
             if use_gps:
@@ -897,16 +913,6 @@ if st.session_state.step == 1:
 # --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
-    
-    if st.session_state.raw_weather_debug:
-        with st.expander("🔍 Raw NOAA LCD / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
-            st.markdown("Inspect this data to verify how the window matching selected timestamps around each top-of-the-hour mark:")
-            st.json(st.session_state.raw_weather_debug)
-            
-            if st.session_state.final_hourly_rows:
-                st.markdown("**Parsed Hourly Values & NOAA Source Timestamp Fed to OSHA Calculator:**")
-                debug_df = pd.DataFrame(st.session_state.final_hourly_rows)[["time_display", "noaa_matched_timestamp", "temperature_f", "relative_humidity_percent", "wind_speed_mph", "barometric_pressure_inhg"]]
-                st.dataframe(debug_df, use_container_width=True)
     
     st.markdown("### Heat Stress Standard")
     standard_choice = st.radio(
@@ -1006,8 +1012,10 @@ elif st.session_state.step == 2:
                             calc_watts = met_val * worker_kg * 1.163
                         else:
                             height_cm = height_in * 2.54
-                            if sex == "Male": rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) + 5
-                            else: rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) - 161
+                            if sex == "Male": 
+                                rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) + 5
+                            else: 
+                                rmr_kcal_day = (10 * worker_kg) + (6.25 * height_cm) - (5 * age) - 161
                             rmr_kcal_hr = rmr_kcal_day / 24.0
                             calc_watts = met_val * rmr_kcal_hr * 1.16222
                     
@@ -1016,7 +1024,7 @@ elif st.session_state.step == 2:
                 
             with st.spinner("Executing calculations..."):
                 data_source_val = st.session_state.location_meta.get("data_source", "Open-Meteo")
-                if data_source_val == "NOAA Station Data (Requires API Key)":
+                if "NOAA" in data_source_val:
                     stn_name = st.session_state.location_meta.get("station_name", "Unknown Station")
                     data_source_label = f"NOAA LCD Station Data ({stn_name})"
                 else:
@@ -1031,6 +1039,17 @@ elif st.session_state.step == 2:
                 st.session_state.results = results
                 st.session_state.step = 3
                 st.rerun()
+
+    st.divider()
+    if st.session_state.raw_weather_debug:
+        with st.expander("🔍 Raw Meteorological Data Diagnostics (Troubleshooting View)", expanded=False):
+            st.markdown("Inspect this data to verify the raw atmospheric matrices returned by the API provider:")
+            st.json(st.session_state.raw_weather_debug)
+            
+            if st.session_state.final_hourly_rows:
+                st.markdown("**Parsed Hourly Values & Source Timestamp Fed to OSHA Calculator:**")
+                debug_df = pd.DataFrame(st.session_state.final_hourly_rows)[["time_display", "noaa_matched_timestamp", "temperature_f", "relative_humidity_percent", "wind_speed_mph", "barometric_pressure_inhg"]]
+                st.dataframe(debug_df, use_container_width=True)
 
 # --- WIZARD STEP 3: INTERACTIVE REPORT VIEWER & EXPORT ---
 elif st.session_state.step == 3:
