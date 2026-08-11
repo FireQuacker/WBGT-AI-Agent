@@ -147,8 +147,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
     url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
     params = {
         "extent": extent,
-        "startdate": date_str,
-        "enddate": date_str,
         "limit": 1000,
         "datasetid": "GHCND"
     }
@@ -160,19 +158,9 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
             
         data = response.json()
         stations = data.get("results", [])
-        
-        # Fallback expansion if exact date query returns no stations
+            
         if not stations:
-            alt_start = (target_date - timedelta(days=1)).strftime("%Y-%m-%d")
-            alt_end = (target_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            params["startdate"] = alt_start
-            params["enddate"] = alt_end
-            response_alt = requests.get(url, headers=headers, params=params, timeout=15)
-            if response_alt.status_code == 200:
-                stations = response_alt.json().get("results", [])
-                
-        if not stations:
-            return {"error": f"No active NOAA stations found within vicinity (~69 miles) for {date_str}. Try switching to Open-Meteo for complete historical reanalysis coverage."}
+            return {"error": f"No NOAA stations found within vicinity (~69 miles) for {date_str}. Try switching to Open-Meteo for complete historical reanalysis coverage."}
             
         for stn in stations:
             stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
