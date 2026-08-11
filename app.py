@@ -141,42 +141,47 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
     except Exception as e:
         return {"error": f"Weather System Error: {str(e)}"}
 
+# =====================================================================
+# STRICT NOAA LCD-ONLY PIPELINE (GHCND BLOCKED)
+# =====================================================================
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    extent = f"{lat-2.5},{lon-2.5},{lat+2.5},{lon+2.5}"
+    extent = f"{lat-1.5},{lon-1.5},{lat+1.5},{lon+1.5}"
     date_str = target_date.strftime("%Y-%m-%d")
     start_iso = f"{date_str}T00:00:00"
     end_iso = f"{date_str}T23:59:59"
     
-    datasets = ["LCD", "GHCND", "ANNUAL", "PRECIP_HLY"]
+    # Strictly limit dataset scope to LCD to completely block GHCND
+    datasetid = "LCD"
+    base_url = "https://www.ncdc.noaa.gov/cdo-api/v2/"
+    
     hourly_data_found = None
     closest_stn = None
     min_dist = float('inf')
-    used_dataset = None
     
-    for datasetid in datasets:
-        url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
-        params = {
+    try:
+        stations_url = f"{base_url}stations"
+        stations_params = {
+            "datasetid": datasetid,
             "extent": extent,
-            "limit": 250,
-            "datasetid": datasetid
+            "limit": 250
         }
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-            if response.status_code != 200:
-                continue
-                
-            stations = response.json().get("results", [])
-            if not stations:
-                continue
-                
+        res = requests.get(stations_url, headers=headers, params=stations_params, timeout=15)
+        if res.status_code == 200:
+            stations = res.json().get("results", [])
+            valid_stations = []
             for stn in stations:
+                stn_id = stn.get("id", "")
+                # Guardrail: Explicitly bypass GHCND stations
+                if "GHCND" in stn_id.upper():
+                    continue
                 stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
+                valid_stations.append(stn)
                 
-            stations_sorted = sorted(stations, key=lambda x: x["computed_dist"])
+            valid_stations = sorted(valid_stations, key=lambda x: x["computed_dist"])
             
-            for stn in stations_sorted[:25]:
-                data_url = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
+            for stn in valid_stations[:15]:
+                data_url = f"{base_url}data"
                 data_params = {
                     "datasetid": datasetid,
                     "stationid": stn["id"],
@@ -185,7 +190,6 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                     "limit": 1000,
                     "units": "standard"
                 }
-                
                 data_res = requests.get(data_url, headers=headers, params=data_params, timeout=20)
                 if data_res.status_code == 200:
                     results = data_res.json().get("results", [])
@@ -193,15 +197,12 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                         hourly_data_found = results
                         closest_stn = stn
                         min_dist = stn["computed_dist"]
-                        used_dataset = datasetid
                         break
-            if hourly_data_found:
-                break
-        except Exception:
-            continue
-            
-    if not hourly_data_found:
-        return {"error": f"No NOAA weather stations reported hourly data within range for {date_str}. Consider using Open-Meteo."}
+    except Exception as e:
+        return {"error": f"NOAA LCD Pipeline Error: {str(e)}"}
+        
+    if not hourly_data_found or not closest_stn:
+        return {"error": f"No valid NOAA LCD stations reported hourly records within range for {date_str}. (GHCND fallback is disabled). Consider using Open-Meteo."}
         
     def clean_val(val, default):
         if val is None: return default
@@ -249,7 +250,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
                 obs_dt = datetime.fromisoformat(clean_dt_str)
                 
                 if window_start <= obs_dt <= window_end:
-                    completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "TMAX", "TAVG", "HourlyRelativeHumidity", "HourlyWindSpeed", "AWND", "HourlyStationPressure", "PRCP"] if metrics.get(d) is not None)
+                    completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "HourlyRelativeHumidity", "HourlyWindSpeed", "HourlyStationPressure"] if metrics.get(d) is not None)
                     time_diff_sec = abs((obs_dt - target_dt).total_seconds())
                     candidates.append({
                         "dt_str": dt_str,
@@ -291,9 +292,9 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
         rec = hourly_records.get(hr, {})
         
-        temp = rec.get("HourlyDryBulbTemperature", rec.get("TMAX", rec.get("TAVG", None)))
+        temp = rec.get("HourlyDryBulbTemperature", None)
         rh = rec.get("HourlyRelativeHumidity", None)
-        wind = rec.get("HourlyWindSpeed", rec.get("AWND", None))
+        wind = rec.get("HourlyWindSpeed", None)
         pressure_hg = rec.get("HourlyStationPressure", None)
         
         if temp is not None: last_temp = temp
@@ -311,11 +312,11 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         "grid_latitude": closest_stn["latitude"],
         "grid_longitude": closest_stn["longitude"],
         "station_name": closest_stn.get("name", closest_stn.get("id")),
-        "dataset_used": used_dataset,
+        "dataset_used": "LCD",
         "distance_miles": min_dist,
         "raw_debug": {
             "station_info": closest_stn,
-            "dataset_queried": used_dataset,
+            "dataset_queried": "LCD",
             "raw_api_results_count": len(hourly_data_found),
             "datatypes_found_in_dataset": list(all_datatypes_present),
             "window_matching_log": match_mapping_log,
@@ -767,11 +768,9 @@ with st.expander("📚 Methodology, Data Sources & About the Author"):
     This application utilizes a highly accurate, dual-geocoding approach to pinpoint workplace locations. Initial location requests are passed through the **US Census Bureau's native geocoding database** to provide exact street-level, regional, and municipal matching. If the primary Census database is unable to resolve an ambiguous or newly developed address, the system automatically engages a secondary fallback protocol utilizing the **Mapbox (OpenStreetMap) API** to ensure precise latitudinal and longitudinal coordinate extraction.
     
     ### 🌤️ Weather Data & Meteorological Modeling
-    After establishing accurate site coordinates, the application interfaces with the **Open-Meteo API** to pull localized weather matrices. 
+    After establishing accurate site coordinates, the application interfaces with the **Open-Meteo API** to pull localized weather matrices, or queries **NOAA's LCD (Local Climatological Data)** hourly station archive when the NOAA API token is selected.
     
-    For historical compliance auditing, this tool depends heavily on the **ERA5 reanalysis model** (the fifth generation ECMWF atmospheric reanalysis of the global climate). ERA5 synthesizes massive arrays of historical meteorological observations—including decades of continuous **NOAA station data**, atmospheric balloon soundings, and satellite imagery—into a cohesive and seamless global grid. This provides an uninterrupted and deeply accurate historical climate record. 
-    
-    *Recent independent scientific evaluations, including [a comprehensive study published by NOAA and related atmospheric researchers](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2023JH000102), have demonstrated that ERA5 currently stands as the most accurate and reliable reanalysis model available for reconstructing historical ground-level weather data.*
+    *Recent independent scientific evaluations, including [a comprehensive study published by NOAA and related atmospheric researchers](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2023JH000102), have demonstrated that ERA5 and high-resolution station feeds currently stand as the most accurate and reliable data available for reconstructing historical ground-level weather data.*
     
     ### 👨‍🔬 About the Developer
     **Andre Taylor** is a Health Scientist for the Occupational Safety and Health Administration (OSHA) and a leading Subject Matter Expert (SME) on workplace heat exposure, physiological hazard assessments, and industrial mitigation strategies. 
@@ -893,7 +892,7 @@ elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
     if st.session_state.raw_weather_debug:
-        with st.expander("🔍 Raw NOAA / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
+        with st.expander("🔍 Raw NOAA LCD / Weather Provider Data Diagnostics (Troubleshooting View)", expanded=False):
             st.markdown("Inspect this data to verify how the window matching selected timestamps around each top-of-the-hour mark:")
             st.json(st.session_state.raw_weather_debug)
             
@@ -1012,7 +1011,7 @@ elif st.session_state.step == 2:
                 data_source_val = st.session_state.location_meta.get("data_source", "Open-Meteo")
                 if data_source_val == "NOAA Station Data (Requires API Key)":
                     stn_name = st.session_state.location_meta.get("station_name", "Unknown Station")
-                    data_source_label = f"NOAA Station Data ({stn_name})"
+                    data_source_label = f"NOAA LCD Station Data ({stn_name})"
                 else:
                     data_source_label = (
                         "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
@@ -1039,7 +1038,7 @@ elif st.session_state.step == 3:
     if meta:
         station_info = ""
         if "station_name" in meta:
-            station_info = f"\n* **NOAA Weather Station:** {meta.get('station_name')}"
+            station_info = f"\n* **NOAA LCD Weather Station:** {meta.get('station_name')}"
             
         st.info(
             f"📍 **Address Audit Trail:**\n"
