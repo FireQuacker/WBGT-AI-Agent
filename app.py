@@ -141,7 +141,7 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
 
 def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
     headers = {"token": token}
-    extent = f"{lat-0.5},{lon-0.5},{lat+0.5},{lon+0.5}"
+    extent = f"{lat-1.0},{lon-1.0},{lat+1.0},{lon+1.0}"
     date_str = target_date.strftime("%Y-%m-%d")
     
     url = "https://www.ncei.noaa.gov/cdo-web/api/v2/stations"
@@ -161,7 +161,7 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         data = response.json()
         stations = data.get("results", [])
         if not stations:
-            return {"error": "No active NOAA stations found within vicinity (~35 miles) for this specific date."}
+            return {"error": "No active NOAA stations found within vicinity (~69 miles) for this specific date."}
             
         # Calculate true distances to find the best nearby matching candidates
         for stn in stations:
@@ -173,8 +173,8 @@ def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token
         closest_stn = None
         min_dist = float('inf')
         
-        # Iterate over up to 5 closest stations to verify actual LCD hourly data is present
-        for stn in stations_sorted[:5]:
+        # Iterate over up to 25 closest stations to verify actual LCD hourly data is present
+        for stn in stations_sorted[:25]:
             station_id_raw = stn["id"]
             station_clean = station_id_raw.split(":")[-1]
             
