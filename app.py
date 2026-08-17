@@ -138,194 +138,109 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
         return {"error": f"Weather System Error: {str(e)}"}
 
 # =====================================================================
-# STRICT NOAA LCD-ONLY PIPELINE (OPTIMIZED TIMEOUT & ERROR HANDLING)
+# NOAA CSV PARSING ENGINE (+/- 10 MINUTE TIE BREAK LOGIC)
 # =====================================================================
-def fetch_weather_noaa_pipeline(lat: float, lon: float, target_date: date, token: str) -> dict:
-    headers = {"token": token}
-    extent = f"{lat-1.5},{lon-1.5},{lat+1.5},{lon+1.5}"
-    date_str = target_date.strftime("%Y-%m-%d")
-    start_iso = f"{date_str}T00:00:00"
-    end_iso = f"{date_str}T23:59:59"
-    
-    datasetid = "LCD"
-    base_url = "https://www.ncdc.noaa.gov/cdo-api/v2/"
-    
-    hourly_data_found = None
-    closest_stn = None
-    min_dist = float('inf')
-    
+def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     try:
-        stations_url = f"{base_url}stations"
-        stations_params = {
-            "datasetid": datasetid,
-            "extent": extent,
-            "limit": 100
-        }
-        res = requests.get(stations_url, headers=headers, params=stations_params, timeout=10)
-        
-        if res.status_code == 200:
-            stations = res.json().get("results", [])
-            valid_stations = []
-            for stn in stations:
-                stn_id = stn.get("id", "")
-                if "GHCND" in stn_id.upper():
-                    continue
-                stn["computed_dist"] = haversine_distance(lat, lon, stn["latitude"], stn["longitude"])
-                valid_stations.append(stn)
-                
-            valid_stations = sorted(valid_stations, key=lambda x: x["computed_dist"])
-            
-            for stn in valid_stations[:3]:
-                data_url = f"{base_url}data"
-                data_params = {
-                    "datasetid": datasetid,
-                    "stationid": stn["id"],
-                    "startdate": start_iso,
-                    "enddate": end_iso,
-                    "limit": 1000,
-                    "units": "standard"
-                }
-                try:
-                    data_res = requests.get(data_url, headers=headers, params=data_params, timeout=7)
-                    if data_res.status_code == 200:
-                        results = data_res.json().get("results", [])
-                        if results:
-                            hourly_data_found = results
-                            closest_stn = stn
-                            min_dist = stn["computed_dist"]
-                            break
-                except requests.exceptions.Timeout:
-                    continue
-        else:
-            return {"error": f"NOAA Stations API returned status code {res.status_code}. Token may be invalid or rate-limited."}
-            
-    except requests.exceptions.Timeout:
-        return {"error": "NOAA CDO API connection timed out. NOAA servers are currently experiencing high latency."}
+        df = pd.read_csv(uploaded_file, dtype=str)
     except Exception as e:
-        return {"error": f"NOAA LCD Pipeline Exception: {str(e)}"}
+        return {"error": f"Failed to read CSV file: {str(e)}"}
         
-    if not hourly_data_found or not closest_stn:
-        return {"error": f"No valid NOAA LCD stations reported hourly records within range for {date_str} before timeout."}
+    if 'DATE' not in df.columns:
+        return {"error": "Invalid CSV format. Expected 'DATE' column from NOAA LCD data."}
         
-    def clean_val(val, default):
-        if val is None: return default
+    df['DATE_parsed'] = pd.to_datetime(df['DATE'], errors='coerce')
+    df = df.dropna(subset=['DATE_parsed'])
+    
+    # Filter the dataset roughly around our target date 
+    target_dt_start = datetime.combine(target_date, datetime.min.time())
+    target_dt_end = target_dt_start + timedelta(days=1)
+    
+    df_day = df[(df['DATE_parsed'] >= (target_dt_start - timedelta(hours=2))) & 
+                (df['DATE_parsed'] <= (target_dt_end + timedelta(hours=2)))].copy()
+                
+    if df_day.empty:
+        return {"error": f"No data found in the CSV for the selected date ({target_date.strftime('%Y-%m-%d')}). Please verify the file covers this timeframe."}
+        
+    # Extract coordinates directly from CSV
+    lat = float(df_day['LATITUDE'].iloc[0]) if 'LATITUDE' in df_day.columns and not pd.isna(df_day['LATITUDE'].iloc[0]) else 0.0
+    lon = float(df_day['LONGITUDE'].iloc[0]) if 'LONGITUDE' in df_day.columns and not pd.isna(df_day['LONGITUDE'].iloc[0]) else 0.0
+    station_name = df_day['NAME'].iloc[0] if 'NAME' in df_day.columns and not pd.isna(df_day['NAME'].iloc[0]) else "NOAA Local CSV Station"
+    
+    def clean_numeric(val):
+        if pd.isna(val): return None
         val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
         try:
             numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
-            return float(numeric) if numeric else default
+            return float(numeric) if numeric else None
         except ValueError:
-            return default
-
-    raw_obs_by_time = {}
-    all_datatypes_present = set()
-    
-    for item in hourly_data_found:
-        dt_str = item.get("date")
-        if not dt_str:
-            continue
-        if dt_str not in raw_obs_by_time:
-            raw_obs_by_time[dt_str] = {}
-        dtype = item.get("datatype")
-        val = clean_val(item.get("value"), None)
-        raw_obs_by_time[dt_str][dtype] = val
-        if dtype:
-            all_datatypes_present.add(dtype)
-
+            return None
+            
     hourly_records = {}
-    match_mapping_log = {}
-    target_date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
-
-    for hr in range(24):
-        target_dt = datetime.combine(target_date_obj, datetime.min.time()) + timedelta(hours=hr)
-        window_start = target_dt - timedelta(minutes=60)
-        window_end = target_dt + timedelta(minutes=60)
+    last_temp, last_rh, last_wind, last_pres = 75.0, 50.0, 5.0, 29.92
+    
+    for hr in range(start_hour, end_hour + 1):
+        target_time = target_dt_start + timedelta(hours=hr)
+        window_start = target_time - timedelta(minutes=10)
+        window_end = target_time + timedelta(minutes=10)
         
-        candidates = []
-        for dt_str, metrics in raw_obs_by_time.items():
-            try:
-                clean_dt_str = dt_str.replace("Z", "")
-                if "+" in clean_dt_str[10:]:
-                    clean_dt_str = clean_dt_str.split("+")[0]
-                elif "-" in clean_dt_str[10:]:
-                    parts = clean_dt_str.split("-")
-                    clean_dt_str = "-".join(parts[:3])
+        # Filter rows to the +/- 10 minute window
+        df_window = df_day[(df_day['DATE_parsed'] >= window_start) & (df_day['DATE_parsed'] <= window_end)].copy()
+        
+        if not df_window.empty:
+            # Calculate time diff in seconds
+            df_window['time_diff'] = (df_window['DATE_parsed'] - target_time).dt.total_seconds()
+            df_window['abs_diff'] = df_window['time_diff'].abs()
+            
+            # Tie breaker logic: Sort by absolute diff first, then actual diff.
+            # Example tie: -5 mins (-300s) vs +5 mins (+300s) -> absolute diff is 300 for both.
+            # Sorting by 'time_diff' second means -300 comes before +300 (time BEFORE top of hour wins).
+            df_window = df_window.sort_values(by=['abs_diff', 'time_diff'], ascending=[True, True])
+            
+            # Find the best row that actually has a temperature reading
+            best_row = None
+            for _, row in df_window.iterrows():
+                if clean_numeric(row.get('HourlyDryBulbTemperature')) is not None:
+                    best_row = row
+                    break
+            
+            # Fallback to the closest time if none had temp data (will use forward fill below)
+            if best_row is None:
+                best_row = df_window.iloc[0]
                 
-                obs_dt = datetime.fromisoformat(clean_dt_str)
-                
-                if window_start <= obs_dt <= window_end:
-                    completeness_score = sum(1 for d in ["HourlyDryBulbTemperature", "HourlyRelativeHumidity", "HourlyWindSpeed", "HourlyStationPressure"] if metrics.get(d) is not None)
-                    time_diff_sec = abs((obs_dt - target_dt).total_seconds())
-                    candidates.append({
-                        "dt_str": dt_str,
-                        "obs_dt": obs_dt,
-                        "metrics": metrics,
-                        "completeness": completeness_score,
-                        "time_diff_sec": time_diff_sec
-                    })
-            except Exception:
-                continue
-                
-        if candidates:
-            candidates.sort(key=lambda x: (-x["completeness"], x["time_diff_sec"]))
-            best_match = candidates[0]
-            hourly_records[hr] = best_match["metrics"]
-            match_mapping_log[hr] = {
-                "matched_noaa_timestamp": best_match["dt_str"],
-                "offset_minutes": round(best_match["time_diff_sec"] / 60.0, 1),
-                "completeness_score": best_match["completeness"]
+            t_val = clean_numeric(best_row.get('HourlyDryBulbTemperature'))
+            rh_val = clean_numeric(best_row.get('HourlyRelativeHumidity'))
+            w_val = clean_numeric(best_row.get('HourlyWindSpeed'))
+            p_val = clean_numeric(best_row.get('HourlyStationPressure'))
+            
+            # Update rolling values for forward fill
+            if t_val is not None: last_temp = t_val
+            if rh_val is not None: last_rh = rh_val
+            if w_val is not None: last_wind = w_val
+            if p_val is not None: last_pres = p_val
+            
+            hourly_records[hr] = {
+                "temperature_f": last_temp,
+                "relative_humidity_percent": last_rh,
+                "wind_speed_mph": last_wind,
+                "barometric_pressure_inhg": last_pres,
+                "matched_timestamp": str(best_row['DATE'])
             }
         else:
-            hourly_records[hr] = {}
-            match_mapping_log[hr] = {"matched_noaa_timestamp": None, "offset_minutes": None, "completeness_score": 0}
-
-    hourly_dict = {
-        "time": [],
-        "temperature_2m": [],
-        "relative_humidity_2m": [],
-        "wind_speed_10m": [],
-        "surface_pressure": []
-    }
-    
-    last_temp = 75.0
-    last_rh = 50.0
-    last_wind = 5.0
-    last_pres = 29.92 * 0.02953
-    
-    for hr in range(24):
-        hourly_dict["time"].append(f"{date_str}T{hr:02d}:00")
-        rec = hourly_records.get(hr, {})
-        
-        temp = rec.get("HourlyDryBulbTemperature", None)
-        rh = rec.get("HourlyRelativeHumidity", None)
-        wind = rec.get("HourlyWindSpeed", None)
-        pressure_hg = rec.get("HourlyStationPressure", None)
-        
-        if temp is not None: last_temp = temp
-        if rh is not None: last_rh = rh
-        if wind is not None: last_wind = wind
-        if pressure_hg is not None: last_pres = pressure_hg
-        
-        hourly_dict["temperature_2m"].append(last_temp)
-        hourly_dict["relative_humidity_2m"].append(last_rh)
-        hourly_dict["wind_speed_10m"].append(last_wind)
-        hourly_dict["surface_pressure"].append((last_pres if pressure_hg is not None else 29.92) / 0.02953)
-        
+            # No data inside the +/- 10 min window, use last known value forward fill
+            hourly_records[hr] = {
+                "temperature_f": last_temp,
+                "relative_humidity_percent": last_rh,
+                "wind_speed_mph": last_wind,
+                "barometric_pressure_inhg": last_pres,
+                "matched_timestamp": "No Data in Window (Forward Filled)"
+            }
+            
     return {
-        "hourly": hourly_dict,
-        "grid_latitude": closest_stn["latitude"],
-        "grid_longitude": closest_stn["longitude"],
-        "station_name": closest_stn.get("name", closest_stn.get("id")),
-        "dataset_used": "LCD",
-        "distance_miles": min_dist,
-        "raw_debug": {
-            "station_info": closest_stn,
-            "dataset_queried": "LCD",
-            "raw_api_results_count": len(hourly_data_found),
-            "datatypes_found_in_dataset": list(all_datatypes_present),
-            "window_matching_log": match_mapping_log,
-            "raw_api_results_sample": hourly_data_found[:30],
-            "parsed_hourly_records_map": hourly_records
-        }
+        "hourly_records": hourly_records,
+        "latitude": lat,
+        "longitude": lon,
+        "station_name": station_name
     }
 
 def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
@@ -655,7 +570,7 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
     return fig
 
 # =====================================================================
-# LOCATION CONFIRMATION POP-UP DIALOG
+# LOCATION CONFIRMATION POP-UP DIALOG (FOR OPEN-METEO ONLY)
 # =====================================================================
 @st.dialog("Confirm Target Location")
 def show_location_confirmation_dialog():
@@ -691,11 +606,8 @@ def show_location_confirmation_dialog():
             
             date_str = target_date.strftime("%Y-%m-%d")
             
-            with st.spinner("Retrieving atmospheric matrices from data provider..."):
-                if "NOAA" in geo.get("data_source", ""):
-                    weather_res = fetch_weather_noaa_pipeline(geo["latitude"], geo["longitude"], target_date, geo["noaa_key"])
-                else:
-                    weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
+            with st.spinner("Retrieving atmospheric matrices from Open-Meteo provider..."):
+                weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
             
             if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]:
                 st.error(weather_res.get("error", "Could not pull valid weather timeline matrices for this date/location."))
@@ -704,10 +616,7 @@ def show_location_confirmation_dialog():
                 grid_lat = weather_res["grid_latitude"]
                 grid_lon = weather_res["grid_longitude"]
                 
-                if "distance_miles" in weather_res:
-                    dist_miles = weather_res["distance_miles"]
-                else:
-                    dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
+                dist_miles = haversine_distance(geo["latitude"], geo["longitude"], grid_lat, grid_lon)
                 
                 st.session_state.location_meta = {
                     "user_entered": geo["raw_entered"],
@@ -717,13 +626,8 @@ def show_location_confirmation_dialog():
                     "grid_lat": grid_lat,
                     "grid_lon": grid_lon,
                     "distance_miles": dist_miles,
-                    "data_source": geo.get("data_source", "Open-Meteo")
+                    "data_source": "Open-Meteo"
                 }
-                
-                if "station_name" in weather_res:
-                    st.session_state.location_meta["station_name"] = weather_res["station_name"]
-                if "dataset_used" in weather_res:
-                    st.session_state.location_meta["dataset_used"] = weather_res["dataset_used"]
                     
                 st.session_state.raw_weather_debug = weather_res.get("raw_debug", None)
                 
@@ -733,15 +637,11 @@ def show_location_confirmation_dialog():
                     if start_hour <= hr_int <= end_hour:
                         ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
                         
-                        noaa_log = st.session_state.raw_weather_debug.get("window_matching_log", {}) if st.session_state.raw_weather_debug else {}
-                        hour_match_info = noaa_log.get(hr_int, {})
-                        matched_ts = hour_match_info.get("matched_noaa_timestamp", "N/A")
-                        
                         active_rows.append({
                             "date_string_final": target_date.strftime("%m/%d/%Y"), 
                             "time_display": ampm, 
                             "hour_24h": hr_int,
-                            "noaa_matched_timestamp": matched_ts,
+                            "noaa_matched_timestamp": "N/A",
                             "user_entered_address": geo["raw_entered"],
                             "validated_address": geo["matched_address"],
                             "latitude": geo["latitude"], "longitude": geo["longitude"],
@@ -790,7 +690,7 @@ with st.expander("📚 Methodology, Data Sources & About the Author"):
     This application utilizes a highly accurate, dual-geocoding approach to pinpoint workplace locations. Initial location requests are passed through the **US Census Bureau's native geocoding database** to provide exact street-level, regional, and municipal matching. If the primary Census database is unable to resolve an ambiguous or newly developed address, the system automatically engages a secondary fallback protocol utilizing the **Mapbox (OpenStreetMap) API** to ensure precise latitudinal and longitudinal coordinate extraction.
     
     ### 🌤️ Weather Data & Meteorological Modeling
-    After establishing accurate site coordinates, the application interfaces with the **Open-Meteo API** to pull localized weather matrices, or queries **NOAA's LCD (Local Climatological Data)** hourly station archive when the NOAA API token is selected.
+    After establishing accurate site coordinates, the application interfaces with the **Open-Meteo API** to pull localized weather matrices, or processes user-uploaded **NOAA Local Climatological Data (LCD)** CSV station archives.
     
     *Recent independent scientific evaluations, including [a comprehensive study published by NOAA and related atmospheric researchers](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2023JH000102), have demonstrated that ERA5 and high-resolution station feeds currently stand as the most accurate and reliable data available for reconstructing historical ground-level weather data.*
     
@@ -809,22 +709,33 @@ if st.session_state.pending_geo is not None:
 if st.session_state.step == 1:
     st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
-    col_loc_header, col_loc_toggle = st.columns([3, 1])
-    with col_loc_header:
-        st.markdown("**Location Details**")
-    with col_loc_toggle:
-        use_gps = st.toggle("Use GPS Coordinates", value=False)
+    st.markdown("**Meteorological Data Provider**")
+    data_source = st.radio("Select Provider:", ["Open-Meteo (Default/Free)", "NOAA Station Data (Local CSV Upload)"])
     
-    if not use_gps:
-        c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
-        with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 7339 State Road")
-        with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Philadelphia")
-        with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., PA")
-        with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 19136")
+    use_gps = False
+    uploaded_noaa_csv = None
+    
+    # Dynamically display UI options based on the provider selection
+    if "NOAA" in data_source:
+        st.info("💡 **NOAA Local Climatological Data (LCD):** Upload a CSV dataset downloaded from the NOAA NCEI tool. The application will automatically extract GPS coordinates and timeline details from the file.")
+        uploaded_noaa_csv = st.file_uploader("Upload NOAA LCD Weather File (.csv)", type=["csv"])
     else:
-        c_gps1, c_gps2 = st.columns(2)
-        with c_gps1: target_lat_in = st.text_input("Latitude", value="", placeholder="e.g., 40.0345")
-        with c_gps2: target_lon_in = st.text_input("Longitude", value="", placeholder="e.g., -75.0181")
+        col_loc_header, col_loc_toggle = st.columns([3, 1])
+        with col_loc_header:
+            st.markdown("**Location Details**")
+        with col_loc_toggle:
+            use_gps = st.toggle("Use GPS Coordinates", value=False)
+        
+        if not use_gps:
+            c_addr1, c_addr2, c_addr3, c_addr4 = st.columns([2, 2, 1, 1.5])
+            with c_addr1: target_street = st.text_input("Street Address (Optional)", value="", placeholder="e.g., 7339 State Road")
+            with c_addr2: target_city = st.text_input("City", value="", placeholder="e.g., Philadelphia")
+            with c_addr3: target_state = st.text_input("State", value="", placeholder="e.g., PA")
+            with c_addr4: target_zip = st.text_input("ZIP Code", value="", placeholder="e.g., 19136")
+        else:
+            c_gps1, c_gps2 = st.columns(2)
+            with c_gps1: target_lat_in = st.text_input("Latitude", value="", placeholder="e.g., 40.0345")
+            with c_gps2: target_lon_in = st.text_input("Longitude", value="", placeholder="e.g., -75.0181")
 
     st.markdown("**Shift & Employee Details**")
     c_shift1, c_shift2, c_shift3 = st.columns([1.5, 2, 1.5])
@@ -839,33 +750,60 @@ if st.session_state.step == 1:
     with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
     with c_shift3: worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
-    st.markdown("**Meteorological Data Provider**")
-    c_data1, c_data2 = st.columns([2, 2])
-    with c_data1:
-        data_source = st.radio("Select Provider:", ["Open-Meteo (Default/Free)", "NOAA Station Data (Requires API Key) [UNDER CONSTRUCTION]"])
-        noaa_selected = "UNDER CONSTRUCTION" in data_source
-    with c_data2:
-        noaa_key = ""
-        if "NOAA" in data_source:
-            if "NOAA_API_KEY" in st.secrets:
-                noaa_key = st.secrets["NOAA_API_KEY"]
-            elif "noaa" in st.secrets and "api_key" in st.secrets["noaa"]:
-                noaa_key = st.secrets["noaa"]["api_key"]
-            elif os.environ.get("NOAA_API_KEY"):
-                noaa_key = os.environ.get("NOAA_API_KEY")
-            else:
-                noaa_key = st.text_input("Enter NOAA CDO API Token:", type="password", help="Obtain from https://www.ncdc.noaa.gov/cdo-web/token")
+    button_text = "Process Weather Data"
     
-    if st.session_state.is_forecast and "NOAA" in data_source:
-        st.warning("⚠️ NOAA Historical Station Data cannot be used for future predictions. Please switch to Open-Meteo or change to a historical date.")
-        
-    button_text = "Fetch Forecasted Weather Data" if st.session_state.is_forecast else "Fetch Historical Weather Data"
-    
-    if st.button(button_text, type="primary", disabled=noaa_selected):
+    if st.button(button_text, type="primary"):
         if st.session_state.is_forecast and "NOAA" in data_source:
-            st.error("Cannot use NOAA Station Data for future forecasts.")
-        elif "NOAA" in data_source and not noaa_key.strip():
-            st.error("NOAA API Token is required when NOAA Station Data is selected.")
+            st.error("Cannot use NOAA Historical CSV Data for future forecasts. Please switch to Open-Meteo or pick a past date.")
+        elif "NOAA" in data_source:
+            if uploaded_noaa_csv is None:
+                st.error("Please upload a NOAA CSV file before proceeding.")
+            else:
+                with st.spinner("Processing NOAA CSV data..."):
+                    noaa_result = process_weather_noaa_csv(uploaded_noaa_csv, target_date, start_hour, end_hour)
+                    if "error" in noaa_result:
+                        st.error(noaa_result["error"])
+                    else:
+                        active_rows = []
+                        for hr_int in range(start_hour, end_hour + 1):
+                            hr_data = noaa_result["hourly_records"][hr_int]
+                            ampm = "12:00 AM" if hr_int==0 else ("12:00 PM" if hr_int==12 else (f"{hr_int-12}:00 PM" if hr_int>12 else f"{hr_int}:00 AM"))
+                            
+                            active_rows.append({
+                                "date_string_final": target_date.strftime("%m/%d/%Y"), 
+                                "time_display": ampm, 
+                                "hour_24h": hr_int,
+                                "noaa_matched_timestamp": hr_data.get("matched_timestamp", "N/A"),
+                                "user_entered_address": "NOAA CSV Upload",
+                                "validated_address": f"Station: {noaa_result['station_name']}",
+                                "latitude": noaa_result["latitude"], "longitude": noaa_result["longitude"],
+                                "grid_latitude": noaa_result["latitude"], "grid_longitude": noaa_result["longitude"],
+                                "grid_distance_miles": 0.0,
+                                "longitude_absolute": abs(noaa_result["longitude"]), 
+                                "tz_value": get_osha_tz_value(noaa_result["longitude"]),
+                                "temperature_f": hr_data["temperature_f"], 
+                                "relative_humidity_percent": int(hr_data["relative_humidity_percent"]), 
+                                "wind_speed_mph": hr_data["wind_speed_mph"], 
+                                "barometric_pressure_inhg": hr_data["barometric_pressure_inhg"]
+                            })
+                        
+                        st.session_state.location_meta = {
+                            "user_entered": "NOAA CSV Upload",
+                            "validated": f"Station: {noaa_result['station_name']}",
+                            "target_lat": noaa_result["latitude"],
+                            "target_lon": noaa_result["longitude"],
+                            "grid_lat": noaa_result["latitude"],
+                            "grid_lon": noaa_result["longitude"],
+                            "distance_miles": 0.0,
+                            "data_source": "NOAA Station Data (Local CSV Upload)",
+                            "station_name": noaa_result["station_name"]
+                        }
+                        
+                        st.session_state.final_hourly_rows = active_rows
+                        st.session_state.worker_weight = worker_weight
+                        st.session_state.location_fallback = False
+                        st.session_state.step = 2
+                        st.rerun()
         else:
             if use_gps:
                 try:
@@ -880,8 +818,7 @@ if st.session_state.step == 1:
                         "target_date": target_date,
                         "shift_hours": (start_hour, end_hour),
                         "worker_weight": worker_weight,
-                        "data_source": data_source,
-                        "noaa_key": noaa_key
+                        "data_source": data_source
                     }
                     st.rerun()
                 except ValueError:
@@ -905,8 +842,7 @@ if st.session_state.step == 1:
                                 "target_date": target_date,
                                 "shift_hours": (start_hour, end_hour),
                                 "worker_weight": worker_weight,
-                                "data_source": data_source,
-                                "noaa_key": noaa_key
+                                "data_source": data_source
                             }
                             st.rerun()
 
