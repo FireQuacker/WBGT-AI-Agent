@@ -40,6 +40,8 @@ if "final_hourly_rows" not in st.session_state:
     st.session_state.final_hourly_rows = None
 if "raw_weather_debug" not in st.session_state:
     st.session_state.raw_weather_debug = None
+if "raw_noaa_df_export" not in st.session_state:
+    st.session_state.raw_noaa_df_export = None
 if "worker_weight" not in st.session_state:
     st.session_state.worker_weight = 154.0
 if "fallback_active" not in st.session_state:
@@ -138,7 +140,7 @@ def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: boo
         return {"error": f"Weather System Error: {str(e)}"}
 
 # =====================================================================
-# NOAA CSV PARSING ENGINE (+/- 10 MINUTE TIE BREAK LOGIC)
+# NOAA CSV PARSING ENGINE (+/- 10 MINUTE TIE BREAK & DST/UNIT HANDLING)
 # =====================================================================
 def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     try:
@@ -177,6 +179,7 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
             return None
             
     hourly_records = {}
+    raw_export_rows = []
     last_temp, last_rh, last_wind, last_pres = 75.0, 50.0, 5.0, 29.92
     
     for hr in range(start_hour, end_hour + 1):
@@ -187,60 +190,100 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
         # Filter rows to the +/- 10 minute window
         df_window = df_day[(df_day['DATE_parsed'] >= window_start) & (df_day['DATE_parsed'] <= window_end)].copy()
         
+        note_additions = []
+        
         if not df_window.empty:
-            # Calculate time diff in seconds
             df_window['time_diff'] = (df_window['DATE_parsed'] - target_time).dt.total_seconds()
             df_window['abs_diff'] = df_window['time_diff'].abs()
-            
-            # Tie breaker logic: Sort by absolute diff first, then actual diff.
-            # Example tie: -5 mins (-300s) vs +5 mins (+300s) -> absolute diff is 300 for both.
-            # Sorting by 'time_diff' second means -300 comes before +300 (time BEFORE top of hour wins).
             df_window = df_window.sort_values(by=['abs_diff', 'time_diff'], ascending=[True, True])
             
-            # Find the best row that actually has a temperature reading
             best_row = None
             for _, row in df_window.iterrows():
                 if clean_numeric(row.get('HourlyDryBulbTemperature')) is not None:
                     best_row = row
                     break
             
-            # Fallback to the closest time if none had temp data (will use forward fill below)
             if best_row is None:
                 best_row = df_window.iloc[0]
                 
-            t_val = clean_numeric(best_row.get('HourlyDryBulbTemperature'))
+            raw_t = clean_numeric(best_row.get('HourlyDryBulbTemperature'))
+            if raw_t is not None:
+                # Temperature on NOAA CSV files is frequently in Celsius (°C). Validate and convert to °F if needed.
+                if raw_t < 45.0:  # Indicative of Celsius scale in ambient weather contexts
+                    last_temp = round((raw_t * 1.8) + 32.0, 1)
+                    note_additions.append(f"NOAA Temp {raw_t}°C converted to {last_temp}°F")
+                else:
+                    last_temp = raw_t
+                    
             rh_val = clean_numeric(best_row.get('HourlyRelativeHumidity'))
             w_val = clean_numeric(best_row.get('HourlyWindSpeed'))
             p_val = clean_numeric(best_row.get('HourlyStationPressure'))
             
-            # Update rolling values for forward fill
-            if t_val is not None: last_temp = t_val
             if rh_val is not None: last_rh = rh_val
             if w_val is not None: last_wind = w_val
-            if p_val is not None: last_pres = p_val
+            
+            if p_val is not None:
+                last_pres = p_val
+            else:
+                note_additions.append("Station Pressure missing; assumed standard 29.92 inHg")
+            
+            matched_ts = str(best_row['DATE'])
+            
+            # Populate raw export row for the 3rd tab
+            raw_export_rows.append({
+                "Target_Date": target_date.strftime("%Y-%m-%d"),
+                "Target_Hour": f"{hr:02d}:00",
+                "Raw_NOAA_Timestamp": matched_ts,
+                "Rounded_DST_Adjusted_Timestamp": target_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "Raw_DryBulb_Temp": best_row.get('HourlyDryBulbTemperature'),
+                "Processed_Temp_F": last_temp,
+                "Raw_Relative_Humidity": best_row.get('HourlyRelativeHumidity'),
+                "Raw_Wind_Speed": best_row.get('HourlyWindSpeed'),
+                "Raw_Station_Pressure": best_row.get('HourlyStationPressure'),
+                "Assumed_Pressure_Used": p_val is None,
+                "Station_Name": station_name
+            })
             
             hourly_records[hr] = {
                 "temperature_f": last_temp,
                 "relative_humidity_percent": last_rh,
                 "wind_speed_mph": last_wind,
                 "barometric_pressure_inhg": last_pres,
-                "matched_timestamp": str(best_row['DATE'])
+                "matched_timestamp": matched_ts,
+                "note_additions": " | ".join(note_additions)
             }
         else:
-            # No data inside the +/- 10 min window, use last known value forward fill
+            raw_export_rows.append({
+                "Target_Date": target_date.strftime("%Y-%m-%d"),
+                "Target_Hour": f"{hr:02d}:00",
+                "Raw_NOAA_Timestamp": "No Data in Window",
+                "Rounded_DST_Adjusted_Timestamp": target_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "Raw_DryBulb_Temp": None,
+                "Processed_Temp_F": last_temp,
+                "Raw_Relative_Humidity": None,
+                "Raw_Wind_Speed": None,
+                "Raw_Station_Pressure": None,
+                "Assumed_Pressure_Used": True,
+                "Station_Name": station_name
+            })
+            
             hourly_records[hr] = {
                 "temperature_f": last_temp,
                 "relative_humidity_percent": last_rh,
                 "wind_speed_mph": last_wind,
                 "barometric_pressure_inhg": last_pres,
-                "matched_timestamp": "No Data in Window (Forward Filled)"
+                "matched_timestamp": "No Data in Window (Forward Filled)",
+                "note_additions": "No Data in Window (Forward Filled) | Station Pressure assumed 29.92 inHg"
             }
             
+    raw_noaa_df = pd.DataFrame(raw_export_rows)
+    
     return {
         "hourly_records": hourly_records,
         "latitude": lat,
         "longitude": lon,
-        "station_name": station_name
+        "station_name": station_name,
+        "raw_noaa_df": raw_noaa_df
     }
 
 def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
@@ -347,10 +390,12 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 safe_pres = max(min(orig_pres, 32.0), 25.0)
 
                 notes_list = []
-                if orig_temp < 32.0: notes_list.append("Air Temp rounded up to 32.0 °F")
-                elif orig_temp > 120.0: notes_list.append("Air Temp rounded down to 120.0 °F")
-                if orig_rh < 1: notes_list.append("RH rounded up to 1%")
-                elif orig_rh > 100: notes_list.append("RH rounded down to 100%")
+                if "note_additions" in hour and hour["note_additions"]:
+                    notes_list.append(hour["note_additions"])
+                if orig_temp < 32.0: notes_list.append("Air Temp clamped up to 32.0 °F")
+                elif orig_temp > 120.0: notes_list.append("Air Temp clamped down to 120.0 °F")
+                if orig_rh < 1: notes_list.append("RH clamped up to 1%")
+                elif orig_rh > 100: notes_list.append("RH clamped down to 100%")
                 if st.session_state.location_fallback: notes_list.append("City/State/Zip used (exact location unresolved)")
                 if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
                 
@@ -455,6 +500,8 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 shade_f = round(shade_f + st.session_state.caf_value, 1)
             
             notes_list = []
+            if "note_additions" in hour and hour["note_additions"]:
+                notes_list.append(hour["note_additions"])
             if st.session_state.location_fallback: notes_list.append("City/State/Zip used (exact location unresolved)")
             if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
             notes_list.append("Offline Stull Fallback Used")
@@ -630,6 +677,7 @@ def show_location_confirmation_dialog():
                 }
                     
                 st.session_state.raw_weather_debug = weather_res.get("raw_debug", None)
+                st.session_state.raw_noaa_df_export = None
                 
                 active_rows = []
                 for i in range(len(hourly["time"])):
@@ -642,6 +690,7 @@ def show_location_confirmation_dialog():
                             "time_display": ampm, 
                             "hour_24h": hr_int,
                             "noaa_matched_timestamp": "N/A",
+                            "note_additions": "",
                             "user_entered_address": geo["raw_entered"],
                             "validated_address": geo["matched_address"],
                             "latitude": geo["latitude"], "longitude": geo["longitude"],
@@ -715,7 +764,6 @@ if st.session_state.step == 1:
     use_gps = False
     uploaded_noaa_csv = None
     
-    # Dynamically display UI options based on the provider selection
     if "NOAA" in data_source:
         st.info("💡 **NOAA Local Climatological Data (LCD):** Upload a CSV dataset downloaded from the NOAA NCEI tool. The application will automatically extract GPS coordinates and timeline details from the file.")
         uploaded_noaa_csv = st.file_uploader("Upload NOAA LCD Weather File (.csv)", type=["csv"])
@@ -774,6 +822,7 @@ if st.session_state.step == 1:
                                 "time_display": ampm, 
                                 "hour_24h": hr_int,
                                 "noaa_matched_timestamp": hr_data.get("matched_timestamp", "N/A"),
+                                "note_additions": hr_data.get("note_additions", ""),
                                 "user_entered_address": "NOAA CSV Upload",
                                 "validated_address": f"Station: {noaa_result['station_name']}",
                                 "latitude": noaa_result["latitude"], "longitude": noaa_result["longitude"],
@@ -799,6 +848,8 @@ if st.session_state.step == 1:
                             "station_name": noaa_result["station_name"]
                         }
                         
+                        st.session_state.raw_noaa_df_export = noaa_result["raw_noaa_df"]
+                        st.session_state.raw_weather_debug = None
                         st.session_state.final_hourly_rows = active_rows
                         st.session_state.worker_weight = worker_weight
                         st.session_state.location_fallback = False
@@ -1051,6 +1102,9 @@ elif st.session_state.step == 3:
         }])
         meta_df.to_excel(writer, sheet_name="Location_Details", index=False)
         
+        if st.session_state.raw_noaa_df_export is not None:
+            st.session_state.raw_noaa_df_export.to_excel(writer, sheet_name="Raw_NOAA_Data", index=False)
+        
         workbook = writer.book
         exposure_sheet = writer.sheets["Exposure_Data"]
         
@@ -1077,6 +1131,7 @@ elif st.session_state.step == 3:
         st.session_state.pending_geo = None
         st.session_state.final_hourly_rows = None
         st.session_state.raw_weather_debug = None
+        st.session_state.raw_noaa_df_export = None
         st.session_state.fallback_active = False
         st.session_state.location_fallback = False
         st.session_state.use_caf = False
