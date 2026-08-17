@@ -151,8 +151,16 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     if 'DATE' not in df.columns:
         return {"error": "Invalid CSV format. Expected 'DATE' column from NOAA LCD data."}
         
-    df['DATE_parsed'] = pd.to_datetime(df['DATE'], errors='coerce')
-    df = df.dropna(subset=['DATE_parsed'])
+    df['DATE_raw'] = pd.to_datetime(df['DATE'], errors='coerce')
+    df = df.dropna(subset=['DATE_raw'])
+    
+    # Apply DST Adjustment Pipeline (March - November)
+    is_dst = df['DATE_raw'].dt.month.between(3, 11)
+    df['DST_Adjusted_Time'] = df['DATE_raw'].copy()
+    df.loc[is_dst, 'DST_Adjusted_Time'] = df['DATE_raw'] + pd.Timedelta(hours=1)
+    
+    # Reassign parsed date reference to the Adjusted Time for structural alignment with the rounding/window search
+    df['DATE_parsed'] = df['DST_Adjusted_Time']
     
     # Filter the dataset roughly around our target date 
     target_dt_start = datetime.combine(target_date, datetime.min.time())
@@ -180,7 +188,6 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
             
     hourly_records = {}
     raw_export_rows = []
-    last_temp, last_rh, last_wind, last_pres = 75.0, 50.0, 5.0, 29.92
     
     for hr in range(start_hour, end_hour + 1):
         target_time = target_dt_start + timedelta(hours=hr)
@@ -207,6 +214,20 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
                 best_row = df_window.iloc[0]
                 
             raw_t = clean_numeric(best_row.get('HourlyDryBulbTemperature'))
+            rh_val = clean_numeric(best_row.get('HourlyRelativeHumidity'))
+            w_val = clean_numeric(best_row.get('HourlyWindSpeed'))
+            p_val = clean_numeric(best_row.get('HourlyStationPressure'))
+            
+            skip_calc = False
+            last_temp = None
+            last_rh = None
+            last_wind = None
+            
+            # Check for critical missing variables
+            if raw_t is None or rh_val is None or w_val is None:
+                note_additions.append("Key variables missing. Suggest a run with Open-Meteo.")
+                skip_calc = True
+            
             if raw_t is not None:
                 # Temperature on NOAA CSV files is frequently in Celsius (°C). Validate and convert to °F if needed.
                 if raw_t < 45.0:  # Indicative of Celsius scale in ambient weather contexts
@@ -215,31 +236,29 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
                 else:
                     last_temp = raw_t
                     
-            rh_val = clean_numeric(best_row.get('HourlyRelativeHumidity'))
-            w_val = clean_numeric(best_row.get('HourlyWindSpeed'))
-            p_val = clean_numeric(best_row.get('HourlyStationPressure'))
-            
             if rh_val is not None: last_rh = rh_val
             if w_val is not None: last_wind = w_val
             
             if p_val is not None:
                 last_pres = p_val
             else:
+                last_pres = 29.92
                 note_additions.append("Station Pressure missing; assumed standard 29.92 inHg")
             
             matched_ts = str(best_row['DATE'])
+            calc_time = best_row['DST_Adjusted_Time'].strftime('%H:%M')
             
             # Populate raw export row for the 3rd tab
             raw_export_rows.append({
                 "Target_Date": target_date.strftime("%Y-%m-%d"),
                 "Target_Hour": f"{hr:02d}:00",
                 "Raw_NOAA_Timestamp": matched_ts,
-                "Rounded_DST_Adjusted_Timestamp": target_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "Raw_DryBulb_Temp": best_row.get('HourlyDryBulbTemperature'),
-                "Processed_Temp_F": last_temp,
-                "Raw_Relative_Humidity": best_row.get('HourlyRelativeHumidity'),
-                "Raw_Wind_Speed": best_row.get('HourlyWindSpeed'),
-                "Raw_Station_Pressure": best_row.get('HourlyStationPressure'),
+                "Rounded_DST_Adjust": target_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "Raw_DryBulb": raw_t,
+                "Processed": last_temp,
+                "Raw_Relative": rh_val,
+                "Raw_Wind": w_val,
+                "Raw_Station": p_val,
                 "Assumed_Pressure_Used": p_val is None,
                 "Station_Name": station_name
             })
@@ -250,30 +269,34 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
                 "wind_speed_mph": last_wind,
                 "barometric_pressure_inhg": last_pres,
                 "matched_timestamp": matched_ts,
-                "note_additions": " | ".join(note_additions)
+                "calculator_time": calc_time,
+                "note_additions": " | ".join(note_additions),
+                "skip_calc": skip_calc
             }
         else:
             raw_export_rows.append({
                 "Target_Date": target_date.strftime("%Y-%m-%d"),
                 "Target_Hour": f"{hr:02d}:00",
                 "Raw_NOAA_Timestamp": "No Data in Window",
-                "Rounded_DST_Adjusted_Timestamp": target_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "Raw_DryBulb_Temp": None,
-                "Processed_Temp_F": last_temp,
-                "Raw_Relative_Humidity": None,
-                "Raw_Wind_Speed": None,
-                "Raw_Station_Pressure": None,
+                "Rounded_DST_Adjust": target_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "Raw_DryBulb": None,
+                "Processed": None,
+                "Raw_Relative": None,
+                "Raw_Wind": None,
+                "Raw_Station": None,
                 "Assumed_Pressure_Used": True,
                 "Station_Name": station_name
             })
             
             hourly_records[hr] = {
-                "temperature_f": last_temp,
-                "relative_humidity_percent": last_rh,
-                "wind_speed_mph": last_wind,
-                "barometric_pressure_inhg": last_pres,
-                "matched_timestamp": "No Data in Window (Forward Filled)",
-                "note_additions": "No Data in Window (Forward Filled) | Station Pressure assumed 29.92 inHg"
+                "temperature_f": None,
+                "relative_humidity_percent": None,
+                "wind_speed_mph": None,
+                "barometric_pressure_inhg": 29.92,
+                "matched_timestamp": "No Data in Window",
+                "calculator_time": f"{hr:02d}:00",
+                "note_additions": "Key variables missing. Suggest a run with Open-Meteo.",
+                "skip_calc": True
             }
             
     raw_noaa_df = pd.DataFrame(raw_export_rows)
@@ -376,6 +399,29 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 status_text.text(f"Scraping OSHA Calculator for hour: {hour['time_display']} ({index+1}/{total_rows})...")
                 progress_bar.progress((index) / total_rows)
                 
+                # Check for skipped records early
+                if hour.get("skip_calc", False):
+                    row_dict = {
+                        "Date": hour["date_string_final"],
+                        "Time": hour["time_display"], 
+                        "Air_Temp_F": hour.get('temperature_f', "N/A") if hour.get('temperature_f') is not None else "N/A", 
+                        "Humidity_Pct": hour.get('relative_humidity_percent', "N/A") if hour.get('relative_humidity_percent') is not None else "N/A", 
+                        "Wind_Speed_mph": hour.get('wind_speed_mph', "N/A") if hour.get('wind_speed_mph') is not None else "N/A",
+                        "Barometric_Pressure_inHg": hour.get('barometric_pressure_inhg', "N/A") if hour.get('barometric_pressure_inhg') is not None else "N/A",
+                        "Sun_WBGT_F": "N/A", 
+                        "Shade_WBGT_F": "N/A", 
+                        "Workload": hour["workload_label"], 
+                        "Adjusted_Watts": hour["final_watts"]
+                    }
+                    row_dict[limit_key] = "N/A"
+                    row_dict[alert_key] = "N/A"
+                    row_dict["Safety_Status"] = "Data Missing"
+                    row_dict["Weather_Data_Source"] = data_source_label
+                    row_dict["Notes"] = hour.get("note_additions", "Key variables missing. Suggest a run with Open-Meteo.")
+                    
+                    computed_results.append(row_dict)
+                    continue
+                
                 row_fallback = False
                 sun_f, shade_f = 0.0, 0.0
                 
@@ -402,9 +448,9 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 notes_str = " | ".join(notes_list) if notes_list else "None"
                 
                 try:
-                    formatted_time = f"{hour['hour_24h']:02d}:00"
+                    calculator_time = hour.get("calculator_time", f"{hour['hour_24h']:02d}:00")
                     target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
-                    target_frame.locator('input[name="tm"]').fill(formatted_time)
+                    target_frame.locator('input[name="tm"]').fill(calculator_time)
                     target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
                     target_frame.locator('input[name="lon"]').fill(str(hour["longitude_absolute"]))
                     
@@ -487,6 +533,29 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
         st.session_state.fallback_active = True
         computed_results = []
         for index, hour in enumerate(hourly_data):
+            # Same safety check in the overall exception fallback branch
+            if hour.get("skip_calc", False):
+                row_dict = {
+                    "Date": hour["date_string_final"],
+                    "Time": hour["time_display"], 
+                    "Air_Temp_F": hour.get('temperature_f', "N/A") if hour.get('temperature_f') is not None else "N/A", 
+                    "Humidity_Pct": hour.get('relative_humidity_percent', "N/A") if hour.get('relative_humidity_percent') is not None else "N/A", 
+                    "Wind_Speed_mph": hour.get('wind_speed_mph', "N/A") if hour.get('wind_speed_mph') is not None else "N/A",
+                    "Barometric_Pressure_inHg": hour.get('barometric_pressure_inhg', "N/A") if hour.get('barometric_pressure_inhg') is not None else "N/A",
+                    "Sun_WBGT_F": "N/A", 
+                    "Shade_WBGT_F": "N/A", 
+                    "Workload": hour["workload_label"], 
+                    "Adjusted_Watts": hour["final_watts"]
+                }
+                row_dict[limit_key] = "N/A"
+                row_dict[alert_key] = "N/A"
+                row_dict["Safety_Status"] = "Data Missing"
+                row_dict["Weather_Data_Source"] = data_source_label
+                row_dict["Notes"] = hour.get("note_additions", "Key variables missing. Suggest a run with Open-Meteo.")
+                
+                computed_results.append(row_dict)
+                continue
+
             orig_temp = float(hour['temperature_f'])
             orig_rh = int(hour['relative_humidity_percent'])
             orig_ws = float(hour['wind_speed_mph'])
@@ -566,9 +635,10 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
     ax.plot(watts_range, limit_curve_f, color='crimson', linestyle='-', linewidth=2.5, label=limit_label)
     ax.plot(watts_range, alert_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label=alert_label)
     
-    x_watts = [r["Adjusted_Watts"] for r in results]
-    y_sun = [r["Sun_WBGT_F"] for r in results]
-    y_shade = [r["Shade_WBGT_F"] for r in results]
+    # Filter N/A results so the plot continues rendering successfully
+    x_watts = [r["Adjusted_Watts"] for r in results if r["Sun_WBGT_F"] != "N/A"]
+    y_sun = [r["Sun_WBGT_F"] for r in results if r["Sun_WBGT_F"] != "N/A"]
+    y_shade = [r["Shade_WBGT_F"] for r in results if r["Shade_WBGT_F"] != "N/A"]
     
     if x_watts:
         min_w, max_w = min(x_watts), max(x_watts)
@@ -586,19 +656,23 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
         ax.add_patch(rect)
     
     if use_caf:
-        ax.scatter(x_watts, y_sun, color='darkred', marker='d', s=130, zorder=5, label='Effective Sun WBGT (CAF-Adjusted)')
-        ax.scatter(x_watts, y_shade, color='darkblue', marker='p', s=120, zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
+        if x_watts:
+            ax.scatter(x_watts, y_sun, color='darkred', marker='d', s=130, zorder=5, label='Effective Sun WBGT (CAF-Adjusted)')
+            ax.scatter(x_watts, y_shade, color='darkblue', marker='p', s=120, zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
         
         for i, r in enumerate(results):
-            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
-            ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
+            if r["Sun_WBGT_F"] != "N/A":
+                ax.annotate(r["Time"], (r["Adjusted_Watts"], r["Sun_WBGT_F"]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
+                ax.annotate(r["Time"], (r["Adjusted_Watts"], r["Shade_WBGT_F"]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
     else:
-        ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
-        ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
+        if x_watts:
+            ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
+            ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
         
         for i, r in enumerate(results):
-            ax.annotate(r["Time"], (x_watts[i], y_sun[i]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
-            ax.annotate(r["Time"], (x_watts[i], y_shade[i]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
+            if r["Sun_WBGT_F"] != "N/A":
+                ax.annotate(r["Time"], (r["Adjusted_Watts"], r["Sun_WBGT_F"]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
+                ax.annotate(r["Time"], (r["Adjusted_Watts"], r["Shade_WBGT_F"]), textcoords="offset points", xytext=(6, -12), fontsize=8, color='darkblue')
 
     title_prefix = "Predictive" if is_forecast else "Historical"
     caf_subtitle = f"\nClothing Adjustment Factor (CAF): {caf_label}" if use_caf else ""
@@ -609,7 +683,11 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
     ax.set_xlim(90, 610)
     
     y_min_bound = 65
-    y_max_bound = max(98, max_wbgt + 5 if x_watts else 98)
+    if x_watts:
+        y_max_bound = max(98, max_wbgt + 5)
+    else:
+        y_max_bound = 98
+        
     ax.set_ylim(y_min_bound, y_max_bound)
     
     ax.grid(True, linestyle=':', alpha=0.5)
@@ -689,6 +767,8 @@ def show_location_confirmation_dialog():
                             "date_string_final": target_date.strftime("%m/%d/%Y"), 
                             "time_display": ampm, 
                             "hour_24h": hr_int,
+                            "calculator_time": f"{hr_int:02d}:00",
+                            "skip_calc": False,
                             "noaa_matched_timestamp": "N/A",
                             "note_additions": "",
                             "user_entered_address": geo["raw_entered"],
@@ -821,6 +901,8 @@ if st.session_state.step == 1:
                                 "date_string_final": target_date.strftime("%m/%d/%Y"), 
                                 "time_display": ampm, 
                                 "hour_24h": hr_int,
+                                "calculator_time": hr_data.get("calculator_time", f"{hr_int:02d}:00"),
+                                "skip_calc": hr_data.get("skip_calc", False),
                                 "noaa_matched_timestamp": hr_data.get("matched_timestamp", "N/A"),
                                 "note_additions": hr_data.get("note_additions", ""),
                                 "user_entered_address": "NOAA CSV Upload",
@@ -831,7 +913,7 @@ if st.session_state.step == 1:
                                 "longitude_absolute": abs(noaa_result["longitude"]), 
                                 "tz_value": get_osha_tz_value(noaa_result["longitude"]),
                                 "temperature_f": hr_data["temperature_f"], 
-                                "relative_humidity_percent": int(hr_data["relative_humidity_percent"]), 
+                                "relative_humidity_percent": hr_data["relative_humidity_percent"], 
                                 "wind_speed_mph": hr_data["wind_speed_mph"], 
                                 "barometric_pressure_inhg": hr_data["barometric_pressure_inhg"]
                             })
