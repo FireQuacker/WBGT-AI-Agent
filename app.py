@@ -1,4 +1,6 @@
 import os
+import sys
+import re
 import subprocess
 import streamlit as st
 import time
@@ -23,10 +25,8 @@ from timezonefinder import TimezoneFinder
 @st.cache_resource
 def install_browser_engine():
     try:
-        # Install required timezone database for pytz
-        subprocess.run(["pip", "install", "tzdata"], check=True)
-        # Install playwright browser
-        subprocess.run(["playwright", "install", "chromium"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "tzdata"], check=False)
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
     except Exception as e:
         st.error(f"Background browser engine initialization warning: {e}")
 
@@ -49,7 +49,6 @@ def reset_app_state():
         if key in st.session_state:
             del st.session_state[key]
     
-    # Re-initialize with default values
     st.session_state.step = 1
     st.session_state.pending_geo = None
     st.session_state.final_hourly_rows = None
@@ -64,7 +63,6 @@ def reset_app_state():
     st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
     st.session_state.standard_choice = "NIOSH (Default)"
     st.session_state.location_meta = {}
-
 
 if "step" not in st.session_state:
     reset_app_state()
@@ -91,18 +89,15 @@ def get_tz_offset_from_coords(lat: float, lon: float, target_date: date) -> str:
     tz_name = tf.timezone_at(lng=lon, lat=lat)
     
     if not tz_name:
-        # Fallback for locations not found (e.g., offshore)
         return str(round(lon / 15))
 
     try:
-        # Create a datetime object for the target date to get the correct DST-aware offset
         timezone = pytz.timezone(tz_name)
-        dt_object = timezone.localize(datetime(target_date.year, target_date.month, target_date.day, 12)) # Noon
+        dt_object = timezone.localize(datetime(target_date.year, target_date.month, target_date.day, 12))
         offset_hours = dt_object.utcoffset().total_seconds() / 3600
         return str(int(offset_hours))
     except pytz.UnknownTimeZoneError:
         return str(round(lon / 15))
-
 
 def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
     try:
@@ -174,12 +169,10 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     if 'DATE' not in df.columns:
         return {"error": "Invalid CSV format. Expected 'DATE' column from NOAA LCD data."}
 
-    # Extract coordinates directly from CSV
     lat = float(df['LATITUDE'].iloc[0]) if 'LATITUDE' in df.columns and not pd.isna(df['LATITUDE'].iloc[0]) else 0.0
     lon = float(df['LONGITUDE'].iloc[0]) if 'LONGITUDE' in df.columns and not pd.isna(df['LONGITUDE'].iloc[0]) else 0.0
     station_name = df['NAME'].iloc[0] if 'NAME' in df.columns and not pd.isna(df['NAME'].iloc[0]) else "NOAA Local CSV Station"
 
-    # Get timezone for the location
     tf = get_timezone_finder()
     tz_name = tf.timezone_at(lng=lon, lat=lat)
     if not tz_name:
@@ -190,18 +183,14 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     df['DATE_raw'] = pd.to_datetime(df['DATE'], errors='coerce')
     df = df.dropna(subset=['DATE_raw'])
     
-    # Check if this station is in Arizona to explicitly disable DST
     is_arizona = ", AZ," in station_name.upper()
     
-    # Localize timestamp to station's timezone (handles DST automatically unless in AZ)
     if is_arizona:
-        # Standard Arizona time is Mountain Standard Time (UTC-7) all year
         az_tz = pytz.timezone("US/Arizona")
         df['DATE_parsed'] = df['DATE_raw'].apply(lambda x: az_tz.localize(x))
     else:
         df['DATE_parsed'] = df['DATE_raw'].apply(lambda x: local_tz.localize(x, is_dst=None))
 
-    # Filter the dataset roughly around our target date 
     if is_arizona:
         target_dt_start = pytz.timezone("US/Arizona").localize(datetime.combine(target_date, datetime.min.time()))
     else:
@@ -231,7 +220,6 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
         window_start = target_time - timedelta(minutes=10)
         window_end = target_time + timedelta(minutes=10)
         
-        # Filter rows to the +/- 10 minute window
         df_window = df_day[(df_day['DATE_parsed'] >= window_start) & (df_day['DATE_parsed'] <= window_end)].copy()
         
         note_additions = []
@@ -384,6 +372,33 @@ def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12
 # =====================================================================
 # REFACTORED FALLBACK & RESULT PROCESSING LOGIC
 # =====================================================================
+def parse_wbgt_val(val_str):
+    """Robustly extracts Fahrenheit temperature value from scraped strings."""
+    if not val_str or val_str == "---":
+        return None
+    val_clean = str(val_str).strip()
+    
+    f_match = re.search(r'([-+]?\d*\.?\d+)\s*°?\s*F', val_clean, re.IGNORECASE)
+    if f_match:
+        return float(f_match.group(1))
+    
+    if "/" in val_clean:
+        parts = val_clean.split("/")
+        for part in parts:
+            if "F" in part.upper():
+                num = re.search(r'[-+]?\d*\.?\d+', part)
+                if num:
+                    return float(num.group())
+            elif "C" in part.upper():
+                num = re.search(r'[-+]?\d*\.?\d+', part)
+                if num:
+                    return round(float(num.group()) * 1.8 + 32, 1)
+                    
+    nums = re.findall(r'[-+]?\d*\.?\d+', val_clean)
+    if nums:
+        return float(nums[0])
+    return None
+
 def process_hourly_result(hour_data, data_source_label, standard_choice, fallback_mode=False):
     """Processes a single hour's data, either from scraper or fallback calculation."""
     is_acgih = "ACGIH" in standard_choice
@@ -392,7 +407,6 @@ def process_hourly_result(hour_data, data_source_label, standard_choice, fallbac
     limit_name = "TLV" if is_acgih else "REL"
     alert_name = "AL" if is_acgih else "RAL"
 
-    # Handle records with missing data first
     if hour_data.get("skip_calc", False):
         row_dict = {
             "Date": hour_data["date_string_final"], "Time": hour_data["time_display"], 
@@ -422,10 +436,9 @@ def process_hourly_result(hour_data, data_source_label, standard_choice, fallbac
         sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour_data['hour_24h'], is_sun=True)
         shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour_data['hour_24h'], is_sun=False)
         notes_list.append("Offline Stull Fallback Used")
-    else: # This assumes sun_f and shade_f are passed in the hour_data from the scraper
+    else:
         sun_f = hour_data['sun_f']
         shade_f = hour_data['shade_f']
-        # Clamp notes are added in the scraper loop, so just append them
         if "clamp_notes" in hour_data:
             notes_list.extend(hour_data['clamp_notes'])
 
@@ -468,22 +481,42 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
     try:
         with sync_playwright() as p:
             status_text.text("Launching headless browser context...")
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"])
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            browser = p.chromium.launch(
+                headless=True, 
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
             page = context.new_page()
             
             target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
             try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(1.5) # Give it a moment to settle
-                target_frame = page
+                page.goto(target_url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                
+            time.sleep(2.0)
+            
+            target_frame = None
+            start_frame_search = time.time()
+            while time.time() - start_frame_search < 10:
                 for frame in page.frames:
-                    try: # Find the right frame with the input fields
-                        frame.locator('input[name="temp"]').wait_for(state="attached", timeout=1200)
-                        target_frame = frame
-                        break
-                    except Exception: continue
-            except Exception: target_frame = page
+                    try:
+                        if frame.locator('input[name="temp"]').count() > 0:
+                            target_frame = frame
+                            break
+                    except Exception:
+                        pass
+                if target_frame:
+                    break
+                if page.locator('input[name="temp"]').count() > 0:
+                    target_frame = page
+                    break
+                time.sleep(0.5)
+
+            if not target_frame:
+                target_frame = page
 
             total_rows = len(hourly_data)
             for index, hour in enumerate(hourly_data):
@@ -526,26 +559,38 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     target_frame.locator('input[name="ws"]').fill(str(safe_ws))
                     target_frame.locator('input[name="pres"]').fill(str(safe_pres))
                     
-                    try: target_frame.locator('select[name="tz"]').select_option(value=hour["tz_value"], timeout=100)
-                    except Exception: pass
+                    try:
+                        target_frame.locator('select[name="tz"]').select_option(value=str(hour["tz_value"]), timeout=2000)
+                    except Exception:
+                        pass
                     
-                    time.sleep(0.1)
-                    target_frame.locator('input[value="Submit"]').click()
+                    time.sleep(0.2)
                     
-                    sun_wbgt, shade_wbgt = "---", "---"
-                    for _ in range(30):
-                        time.sleep(0.1)
+                    submit_btn = target_frame.locator('input[value="Submit"]')
+                    if submit_btn.count() > 0:
+                        submit_btn.click()
+                    else:
+                        target_frame.locator('input[type="submit"]').click()
+                    
+                    fetched_success = False
+                    for _ in range(40):
+                        time.sleep(0.2)
                         live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
                         if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
-                            sun_wbgt = live_sun_val.strip()
-                            shade_wbgt = target_frame.locator('input[name="wbgt_shade"]').input_value().strip()
-                            break
+                            live_shade_val = target_frame.locator('input[name="wbgt_shade"]').input_value()
+                            parsed_sun = parse_wbgt_val(live_sun_val)
+                            parsed_shade = parse_wbgt_val(live_shade_val)
+                            if parsed_sun is not None and parsed_shade is not None:
+                                sun_f = parsed_sun
+                                shade_f = parsed_shade
+                                fetched_success = True
+                                break
                     
-                    if "/" in sun_wbgt:
-                        sun_f = float(sun_wbgt.split("/")[1].replace("F","").strip())
-                        shade_f = float(shade_wbgt.split("/")[1].replace("F","").strip())
-                    else: row_fallback = True
-                except Exception: row_fallback = True
+                    if not fetched_success:
+                        row_fallback = True
+                except Exception as e:
+                    row_fallback = True
+                    hour['note_additions'] = (str(hour.get('note_additions', '')) + f" | Scraper error: {str(e)}").strip(" | ")
                 
                 hour['sun_f'] = sun_f
                 hour['shade_f'] = shade_f
@@ -554,7 +599,7 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 
             browser.close()
             
-    except Exception: # Global fallback if browser fails entirely
+    except Exception as e:
         computed_results = [process_hourly_result(h, data_source_label, standard_choice, fallback_mode=True) for h in hourly_data]
 
     progress_bar.progress(1.0)
@@ -610,7 +655,6 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
             ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
             ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
     
-    # Annotations
     for r in results:
         if r["Sun_WBGT_F"] != "N/A":
             ax.annotate(r["Time"], (r["Adjusted_Watts"], r["Sun_WBGT_F"]), textcoords="offset points", xytext=(6, 5), fontsize=8, color='darkred', fontweight='bold')
