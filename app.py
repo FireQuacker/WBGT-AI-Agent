@@ -800,13 +800,13 @@ def show_location_confirmation_dialog():
 # =====================================================================
 st.session_state.is_forecast = st.toggle(
     "📅 Switch to Future Forecast Mode (For Planning & Prediction)", 
-    value=st.session_state.is_forecast,
+    value=st.session_state.get("is_forecast", False),
     disabled=(st.session_state.step > 1)
 )
 
 if st.session_state.is_forecast:
     st.title("🌤️ OSHA-WBGT Predictive Forecast Calculator")
-    st.warning("**LEGAL DISCLAIMER & WARNING:** This tool is currently utilizing *forecasted* meteorological models for future planning. Weather conditions are inherently dynamic and can shift rapidly. These predictions may not perfectly reflect actual micro-climate conditions on site. Employers must not rely solely on this forecast; on-site environmental monitoring and situational awareness remain mandatory to ensure worker safety and compliance. This output is for preliminary hazard planning purposes only.")
+    st.warning("⚠️ **FORECAST WARNING:** This tool uses forecast models for future planning. On-site environmental tracking remains mandatory.")
 else:
     st.title("☀️ OSHA-WBGT Localized Calculator")
 
@@ -816,17 +816,25 @@ st.divider()
 with st.expander("📚 Methodology, Data Sources & About the Author"):
     st.markdown("""
     ### 📍 Address Matching & Geocoding Pipeline
-    This application utilizes a highly accurate, dual-geocoding approach to pinpoint workplace locations. Initial location requests are passed through the **US Census Bureau's native geocoding database** to provide exact street-level, regional, and municipal matching. If the primary Census database is unable to resolve an ambiguous or newly developed address, the system automatically engages a secondary fallback protocol utilizing the **Mapbox (OpenStreetMap) API** to ensure precise latitudinal and longitudinal coordinate extraction.
-    
+    This application utilizes a highly accurate, dual-geocoding approach to pinpoint workplace locations. Initial location requests are passed through the **US Census Bureau's native geocoding database** for street-level matching. If this fails, the system automatically uses the **Mapbox (OpenStreetMap) API** to ensure precise coordinate extraction.
+
     ### 🌤️ Weather Data & Meteorological Modeling
-    After establishing accurate site coordinates, the application interfaces with the **Open-Meteo API** to pull localized weather matrices, or processes user-uploaded **NOAA Local Climatological Data (LCD)** CSV station archives.
-    
-    *Recent independent scientific evaluations, including [a comprehensive study published by NOAA and related atmospheric researchers](https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2023JH000102), have demonstrated that ERA5 and high-resolution station feeds currently stand as the most accurate and reliable data available for reconstructing historical ground-level weather data.*
-    
+    After establishing coordinates, the application uses one of two methods for weather data:
+    1.  **Open-Meteo API:** For both historical and future forecast data, the app interfaces with the Open-Meteo API. 
+        - **Historical Mode:** Uses the ERA5 global reanalysis dataset.
+        - **Forecast Mode:** Uses a blend of leading forecast models like NOAA's GFS and HRRR.
+    2.  **NOAA Local CSV Upload:** Users can upload a CSV file from the NOAA NCEI database. The application intelligently parses this data, using the station's coordinates to determine the local time zone and automatically handle Daylight Saving Time (DST) for the given date.
+
+    ### 🤖 Automation and Fallback Logic
+    The application automates data entry into the official **[OSHA WBGT Calculator](https://www.osha.gov/heat-exposure/wbgt-calculator)**. Using a headless browser, it submits the weather data for each hour and scrapes the resulting WBGT values. If the OSHA website is unreachable or the process fails, a built-in **Stull's Equation Fallback** is automatically triggered to estimate the WBGT based on meteorological principles.
+
+    ### ⚖️ Workload Calculation
+    Worker metabolism is calculated using two methods:
+    1.  **Standard Method:** Users select a workload (Light, Moderate, etc.). The base wattage is then adjusted proportionally based on the worker's weight relative to a standard 154 lb (70 kg) reference.
+    2.  **Advanced Clinical Method:** Users can input a specific MET value. The app converts this to watts, with options to use a standard formula or a more precise calculation based on the worker's individual biometrics (age, sex, height) via the Mifflin-St Jeor equation.
+
     ### 👨‍🔬 About the Developer
-    **Andre Taylor** is a Health Scientist for the Occupational Safety and Health Administration (OSHA) and a leading Subject Matter Expert (SME) on workplace heat exposure, physiological hazard assessments, and industrial mitigation strategies. 
-    
-    Bringing over 20 years of foundational nursing experience to his role alongside a prominent background as a Compliance Safety and Health Officer (CSHO), Andre bridges the critical operational gap between clinical health sciences and practical, on-the-ground occupational safety. As an established process improvement specialist, data scientist, and AI developer, he is deeply dedicated to engineering modernized, high-efficiency regulatory tools that empower safety professionals to better protect worker health.
+    **Andre Taylor** is a Health Scientist for the Occupational Safety and Health Administration (OSHA) and a leading Subject Matter Expert (SME) on workplace heat exposure, physiological hazard assessments, and industrial mitigation strategies. Andre bridges the critical operational gap between clinical health sciences and practical, on-the-ground occupational safety.
     """)
 
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", "") if hasattr(st, "secrets") else "")
