@@ -1,6 +1,4 @@
 import os
-import sys
-import re
 import subprocess
 import streamlit as st
 import time
@@ -9,7 +7,7 @@ import io
 import requests
 import urllib.parse
 from datetime import datetime, date, timedelta
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, expect
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -18,6 +16,19 @@ import openpyxl
 from openpyxl.drawing.image import Image as OpenPyxlImage
 import pytz
 from timezonefinder import TimezoneFinder
+
+# =====================================================================
+# ONE-TIME PLAYWRIGHT INSTALLER (PREVENTS RE-RUN LAG)
+# =====================================================================
+@st.cache_resource
+def install_browser_engine():
+    try:
+        subprocess.run(["pip", "install", "tzdata"], check=True)
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        st.error(f"Background browser engine initialization warning: {e}")
+
+install_browser_engine()
 
 # =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
@@ -32,6 +43,8 @@ def reset_app_state():
         "location_fallback", "is_forecast", "use_caf", "caf_value",
         "caf_label", "standard_choice", "location_meta", "results"
     ]
+    is_forecast = st.session_state.get('is_forecast', False)
+    
     for key in keys_to_reset:
         if key in st.session_state:
             del st.session_state[key]
@@ -44,7 +57,7 @@ def reset_app_state():
     st.session_state.worker_weight = 154.0
     st.session_state.fallback_active = False
     st.session_state.location_fallback = False
-    st.session_state.is_forecast = False
+    st.session_state.is_forecast = is_forecast
     st.session_state.use_caf = False
     st.session_state.caf_value = 0.0
     st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
@@ -70,25 +83,14 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return round(R * c, 2)
 
-def get_tz_name_from_coords(lat: float, lon: float) -> str:
-    """Gets the IANA Timezone string for context injection (e.g., 'America/New_York')."""
-    tf = get_timezone_finder()
-    tz_name = tf.timezone_at(lng=lon, lat=lat)
-    return tz_name or "UTC"
-
 def get_tz_offset_from_coords(lat: float, lon: float, target_date: date) -> str:
-    """Gets the UTC offset as a string (e.g., '-5' or '-4.5') for a given location and date."""
     tf = get_timezone_finder()
     tz_name = tf.timezone_at(lng=lon, lat=lat)
-    
-    if not tz_name:
-        return str(round(lon / 15))
-
+    if not tz_name: return str(round(lon / 15))
     try:
         timezone = pytz.timezone(tz_name)
         dt_object = timezone.localize(datetime(target_date.year, target_date.month, target_date.day, 12))
-        offset_hours = dt_object.utcoffset().total_seconds() / 3600
-        return str(int(offset_hours)) if offset_hours.is_integer() else str(offset_hours)
+        return str(int(dt_object.utcoffset().total_seconds() / 3600))
     except pytz.UnknownTimeZoneError:
         return str(round(lon / 15))
 
@@ -97,537 +99,201 @@ def geocode_address_native(address: str, mapbox_key: str = None) -> dict:
         census_url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
         census_params = {"address": address, "benchmark": "Public_AR_Current", "format": "json"}
         census_response = requests.get(census_url, params=census_params, timeout=10)
-        
         if census_response.status_code == 200:
             data = census_response.json()
             matches = data.get("result", {}).get("addressMatches", [])
             if matches:
                 coords = matches[0]["coordinates"]
-                matched_str = matches[0].get("matchedAddress", address)
-                return {"latitude": coords["y"], "longitude": coords["x"], "matched_address": matched_str}
-    except Exception:
-        pass
-
-    if not mapbox_key:
-        return {"error": "US Census database could not pinpoint this address. Please verify address details or provide a MAPBOX_API_KEY in settings."}
-    
+                return {"latitude": coords["y"], "longitude": coords["x"], "matched_address": matches[0].get("matchedAddress", address)}
+    except Exception: pass
+    if not mapbox_key: return {"error": "US Census geocoder failed. A Mapbox API key is required as a fallback."}
     try:
         encoded_address = urllib.parse.quote(address)
         mapbox_url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{encoded_address}.json"
         mapbox_params = {"access_token": mapbox_key, "limit": 1}
         mapbox_response = requests.get(mapbox_url, params=mapbox_params, timeout=10)
-        
         if mapbox_response.status_code == 200:
             data = mapbox_response.json()
-            features = data.get("features", [])
-            if features:
-                coords = features[0]["center"]
-                matched_str = features[0].get("place_name", address)
-                return {"latitude": coords[1], "longitude": coords[0], "matched_address": matched_str}
-        
-        return {"error": "Location coordinates could not be resolved."}
-    except Exception as e:
-        return {"error": f"Mapbox Fallback System Error: {str(e)}"}
+            if data.get("features"):
+                coords = data["features"][0]["center"]
+                return {"latitude": coords[1], "longitude": coords[0], "matched_address": data["features"][0].get("place_name", address)}
+        return {"error": "Mapbox geocoding failed to resolve the address."}
+    except Exception as e: return {"error": f"Mapbox Fallback Error: {str(e)}"}
 
 def fetch_weather_native(lat: float, lon: float, date_str: str, is_forecast: bool) -> dict:
     url = "https://api.open-meteo.com/v1/forecast" if is_forecast else "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str,
-        "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"],
-        "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "timezone": "auto"
-    }
+    params = {"latitude": lat, "longitude": lon, "start_date": date_str, "end_date": date_str, "hourly": ["temperature_2m", "relative_humidity_2m", "surface_pressure", "wind_speed_10m"], "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "timezone": "auto"}
     try:
         response = requests.get(url, params=params, timeout=15)
-        if response.status_code != 200:
-            return {"error": f"Weather API blocked the request (HTTP {response.status_code})."}
+        if response.status_code != 200: return {"error": f"Weather API Error (HTTP {response.status_code})."}
         data = response.json()
-        return {
-            "hourly": data.get("hourly", {}),
-            "grid_latitude": data.get("latitude", lat),
-            "grid_longitude": data.get("longitude", lon),
-            "raw_debug": data
-        }
-    except Exception as e:
-        return {"error": f"Weather System Error: {str(e)}"}
+        return {"hourly": data.get("hourly", {}), "grid_latitude": data.get("latitude", lat), "grid_longitude": data.get("longitude", lon), "raw_debug": data}
+    except Exception as e: return {"error": f"Weather System Error: {str(e)}"}
 
-# =====================================================================
-# NOAA CSV PARSING ENGINE (+/- 10 MINUTE TIE BREAK & DST/UNIT HANDLING)
-# =====================================================================
 def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     try:
         df = pd.read_csv(uploaded_file, dtype=str)
-    except Exception as e:
-        return {"error": f"Failed to read CSV file: {str(e)}"}
+    except Exception as e: return {"error": f"Failed to read CSV file: {str(e)}"}
+    if 'DATE' not in df.columns: return {"error": "Invalid CSV: 'DATE' column not found."}
 
-    if 'DATE' not in df.columns:
-        return {"error": "Invalid CSV format. Expected 'DATE' column from NOAA LCD data."}
-
-    lat = float(df['LATITUDE'].iloc[0]) if 'LATITUDE' in df.columns and not pd.isna(df['LATITUDE'].iloc[0]) else 0.0
-    lon = float(df['LONGITUDE'].iloc[0]) if 'LONGITUDE' in df.columns and not pd.isna(df['LONGITUDE'].iloc[0]) else 0.0
-    station_name = df['NAME'].iloc[0] if 'NAME' in df.columns and not pd.isna(df['NAME'].iloc[0]) else "NOAA Local CSV Station"
+    lat = float(df['LATITUDE'].iloc[0]) if 'LATITUDE' in df.columns and pd.notna(df['LATITUDE'].iloc[0]) else 0.0
+    lon = float(df['LONGITUDE'].iloc[0]) if 'LONGITUDE' in df.columns and pd.notna(df['LONGITUDE'].iloc[0]) else 0.0
+    station_name = df['NAME'].iloc[0] if 'NAME' in df.columns and pd.notna(df['NAME'].iloc[0]) else "NOAA CSV Station"
 
     tf = get_timezone_finder()
     tz_name = tf.timezone_at(lng=lon, lat=lat)
-    if not tz_name:
-        return {"error": f"Could not determine timezone for station at Lat: {lat}, Lon: {lon}."}
-    
+    if not tz_name: return {"error": f"Could not determine timezone for station: {station_name}."}
     local_tz = pytz.timezone(tz_name)
 
     df['DATE_raw'] = pd.to_datetime(df['DATE'], errors='coerce')
-    df = df.dropna(subset=['DATE_raw'])
-    
-    is_arizona = ", AZ," in station_name.upper()
-    
-    if is_arizona:
-        az_tz = pytz.timezone("US/Arizona")
-        df['DATE_parsed'] = df['DATE_raw'].apply(lambda x: az_tz.localize(x))
-    else:
-        df['DATE_parsed'] = df['DATE_raw'].apply(lambda x: local_tz.localize(x, is_dst=None))
+    df.dropna(subset=['DATE_raw'], inplace=True)
+    df['DATE_parsed'] = df['DATE_raw'].apply(lambda x: local_tz.localize(x, is_dst=None))
 
-    if is_arizona:
-        target_dt_start = pytz.timezone("US/Arizona").localize(datetime.combine(target_date, datetime.min.time()))
-    else:
-        target_dt_start = local_tz.localize(datetime.combine(target_date, datetime.min.time()))
-    target_dt_end = target_dt_start + timedelta(days=1)
-    
-    df_day = df[(df['DATE_parsed'] >= (target_dt_start - timedelta(hours=2))) & 
-                (df['DATE_parsed'] <= (target_dt_end + timedelta(hours=2)))].copy()
-                
-    if df_day.empty:
-        return {"error": f"No data found in the CSV for the selected date ({target_date.strftime('%Y-%m-%d')}). Please verify the file covers this timeframe."}
-        
+    target_dt_start = local_tz.localize(datetime.combine(target_date, datetime.min.time()))
+    df_day = df[(df['DATE_parsed'] >= (target_dt_start - timedelta(hours=2))) & (df['DATE_parsed'] <= (target_dt_start + timedelta(days=1, hours=2)))].copy()
+    if df_day.empty: return {"error": f"No data in CSV for {target_date.strftime('%Y-%m-%d')}."}
+
     def clean_numeric(val):
         if pd.isna(val): return None
-        val_str = str(val).strip().replace('*', '').replace('s', '').replace('V', '')
-        try:
-            numeric = ''.join(c for c in val_str if c.isdigit() or c == '.' or c == '-')
-            return float(numeric) if numeric else None
-        except ValueError:
-            return None
+        val_str = str(val).strip().replace('*','').replace('s','').replace('V','')
+        try: return float(''.join(c for c in val_str if c.isdigit() or c in '.-'))
+        except (ValueError, TypeError): return None
             
     hourly_records = {}
-    raw_export_rows = []
-    
     for hr in range(start_hour, end_hour + 1):
         target_time = target_dt_start + timedelta(hours=hr)
-        window_start = target_time - timedelta(minutes=10)
-        window_end = target_time + timedelta(minutes=10)
+        window = df_day[(df_day['DATE_parsed'] >= (target_time - timedelta(minutes=10))) & (df_day['DATE_parsed'] <= (target_time + timedelta(minutes=10)))].copy()
         
-        df_window = df_day[(df_day['DATE_parsed'] >= window_start) & (df_day['DATE_parsed'] <= window_end)].copy()
-        
-        note_additions = []
-        
-        if not df_window.empty:
-            df_window['time_diff'] = (df_window['DATE_parsed'] - target_time).dt.total_seconds()
-            df_window['abs_diff'] = df_window['time_diff'].abs()
-            df_window = df_window.sort_values(by=['abs_diff', 'time_diff'], ascending=[True, True])
+        if not window.empty:
+            window['time_diff'] = abs((window['DATE_parsed'] - target_time).dt.total_seconds())
+            best_row = window.sort_values(by='time_diff').iloc[0]
+            raw_t, rh, ws, pres = [clean_numeric(best_row.get(col)) for col in ['HourlyDryBulbTemperature', 'HourlyRelativeHumidity', 'HourlyWindSpeed', 'HourlyStationPressure']]
+            notes = []
+            if any(v is None for v in [raw_t, rh, ws]): notes.append("Key variables missing.")
             
-            best_row = None
-            for _, row in df_window.iterrows():
-                if clean_numeric(row.get('HourlyDryBulbTemperature')) is not None:
-                    best_row = row
-                    break
+            temp = round((raw_t * 1.8) + 32, 1) if raw_t is not None and raw_t < 45.0 else raw_t
+            if raw_t is not None and raw_t < 45.0: notes.append(f"Temp {raw_t}°C conv to {temp}°F")
+            final_pres = pres if pres is not None else 29.92
+            if pres is None: notes.append("Pressure missing; assumed 29.92 inHg")
             
-            if best_row is None:
-                best_row = df_window.iloc[0]
-                
-            raw_t = clean_numeric(best_row.get('HourlyDryBulbTemperature'))
-            rh_val = clean_numeric(best_row.get('HourlyRelativeHumidity'))
-            w_val = clean_numeric(best_row.get('HourlyWindSpeed'))
-            p_val = clean_numeric(best_row.get('HourlyStationPressure'))
-            
-            skip_calc = False
-            last_temp = None
-            last_rh = None
-            last_wind = None
-            
-            if raw_t is None or rh_val is None or w_val is None:
-                note_additions.append("Key variables missing. Suggest a run with Open-Meteo.")
-                skip_calc = True
-            
-            if raw_t is not None:
-                if raw_t < 45.0:
-                    last_temp = round((raw_t * 1.8) + 32.0, 1)
-                    note_additions.append(f"NOAA Temp {raw_t}°C converted to {last_temp}°F")
-                else:
-                    last_temp = raw_t
-                    
-            if rh_val is not None: last_rh = rh_val
-            if w_val is not None: last_wind = w_val
-            
-            if p_val is not None:
-                last_pres = p_val
-            else:
-                last_pres = 29.92
-                note_additions.append("Station Pressure missing; assumed standard 29.92 inHg")
-            
-            matched_ts = str(best_row['DATE'])
-            calc_time = best_row['DATE_parsed'].strftime('%H:%M')
-            
-            raw_export_rows.append({
-                "Target_Date": target_date.strftime("%Y-%m-%d"),
-                "Target_Hour": f"{hr:02d}:00",
-                "Raw_NOAA_Timestamp": matched_ts,
-                "DST_Aware_Timestamp": target_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                "Raw_DryBulb": raw_t,
-                "Processed": last_temp,
-                "Raw_Relative": rh_val,
-                "Raw_Wind": w_val,
-                "Raw_Station": p_val,
-                "Assumed_Pressure_Used": p_val is None,
-                "Station_Name": station_name
-            })
-            
-            hourly_records[hr] = {
-                "temperature_f": last_temp,
-                "relative_humidity_percent": last_rh,
-                "wind_speed_mph": last_wind,
-                "barometric_pressure_inhg": last_pres,
-                "matched_timestamp": matched_ts,
-                "calculator_time": calc_time,
-                "note_additions": " | ".join(note_additions),
-                "skip_calc": skip_calc
-            }
+            hourly_records[hr] = {"temperature_f": temp, "relative_humidity_percent": rh, "wind_speed_mph": ws, "barometric_pressure_inhg": final_pres, "calculator_time": best_row['DATE_parsed'].strftime('%H:%M'), "note_additions": " | ".join(notes), "skip_calc": any(v is None for v in [raw_t, rh, ws])}
         else:
-            raw_export_rows.append({
-                "Target_Date": target_date.strftime("%Y-%m-%d"),
-                "Target_Hour": f"{hr:02d}:00",
-                "Raw_NOAA_Timestamp": "No Data in Window",
-                "DST_Aware_Timestamp": target_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                "Raw_DryBulb": None, "Processed": None, "Raw_Relative": None,
-                "Raw_Wind": None, "Raw_Station": None, "Assumed_Pressure_Used": True,
-                "Station_Name": station_name
-            })
-            
-            hourly_records[hr] = {
-                "temperature_f": None, "relative_humidity_percent": None, "wind_speed_mph": None,
-                "barometric_pressure_inhg": 29.92, "matched_timestamp": "No Data in Window",
-                "calculator_time": f"{hr:02d}:00",
-                "note_additions": "Key variables missing. Suggest a run with Open-Meteo.",
-                "skip_calc": True
-            }
-            
-    raw_noaa_df = pd.DataFrame(raw_export_rows)
-    
-    return {
-        "hourly_records": hourly_records, "latitude": lat, "longitude": lon,
-        "station_name": station_name, "raw_noaa_df": raw_noaa_df
-    }
-
-def resolve_location(street: str, city: str, state: str, zip_code: str, mapbox_key: str):
-    street = street.strip()
-    city = city.strip()
-    state = state.strip()
-    zip_code = zip_code.strip()
-    
-    exact_parts = [p for p in [street, city, state, zip_code] if p]
-    exact_address = ", ".join(exact_parts)
-    
-    general_parts = [p for p in [city, state, zip_code] if p]
-    general_address = ", ".join(general_parts)
-    
-    if street:
-        res1 = geocode_address_native(exact_address, mapbox_key)
-        if "error" not in res1:
-            return res1, False, exact_address
-            
-    if general_address:
-        res2 = geocode_address_native(general_address, mapbox_key)
-        if "error" not in res2:
-            return res2, True, general_address
-            
-    return {"error": "Location coordinates could not be resolved. Please verify City, State, and ZIP Code."}, False, exact_address or general_address
+            hourly_records[hr] = {"temperature_f": None, "relative_humidity_percent": None, "wind_speed_mph": None, "barometric_pressure_inhg": 29.92, "calculator_time": f"{hr:02d}:00", "note_additions": "No data in window.", "skip_calc": True}
+    return {"hourly_records": hourly_records, "latitude": lat, "longitude": lon, "station_name": station_name}
 
 def calculate_wbgt_meteorological_fallback(temp_f, rh_pct, wind_mph, hour_24h=12, is_sun=True):
-    tc = (temp_f - 32) * 5.0 / 9.0
-    rh = rh_pct
-    tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) 
-          + math.atan(tc + rh) 
-          + math.atan(rh - 1.676331) 
-          + 0.00391838 * (rh)**1.5 * math.atan(0.023101 * rh) 
-          - 4.686035)
-    
+    tc = (temp_f - 32) * 5.0 / 9.0; rh = rh_pct
+    tw = (tc * math.atan(0.151977 * (rh + 8.313766)**0.5) + math.atan(tc + rh) - math.atan(rh - 1.676331) + 0.00391838 * (rh**1.5) * math.atan(0.023101 * rh) - 4.686035)
+    tg_c = tc + 1.0
     if is_sun:
         wind_ms = max(wind_mph * 0.44704, 0.1)
-        if 6 <= hour_24h <= 18:
-            solar_rad = 850.0 * math.sin(math.pi * (hour_24h - 6) / 12.0)
-        else:
-            solar_rad = 0.0
-            
+        solar_rad = 850.0 * math.sin(math.pi * (hour_24h - 6) / 12.0) if 6 <= hour_24h <= 18 else 0.0
         tg_c = tc + 0.015 * solar_rad - 0.12 * wind_ms
         if tg_c < tc: tg_c = tc + 0.5
-    else:
-        tg_c = tc + 1.0
-        
     wbgt_c = (0.7 * tw + 0.2 * tg_c + 0.1 * tc) if is_sun else (0.7 * tw + 0.3 * tg_c)
     return round((wbgt_c * 1.8) + 32, 1)
 
-# =====================================================================
-# REFACTORED FALLBACK & RESULT PROCESSING LOGIC
-# =====================================================================
-def parse_wbgt_val(val_str):
-    """Robustly extracts Fahrenheit temperature value from scraped strings."""
-    if not val_str or val_str == "---":
-        return None
-    val_clean = str(val_str).strip()
-    
-    f_match = re.search(r'([-+]?\d*\.?\d+)\s*°?\s*F', val_clean, re.IGNORECASE)
-    if f_match:
-        return float(f_match.group(1))
-    
-    if "/" in val_clean:
-        parts = val_clean.split("/")
-        for part in parts:
-            if "F" in part.upper():
-                num = re.search(r'[-+]?\d*\.?\d+', part)
-                if num:
-                    return float(num.group())
-            elif "C" in part.upper():
-                num = re.search(r'[-+]?\d*\.?\d+', part)
-                if num:
-                    return round(float(num.group()) * 1.8 + 32, 1)
-                    
-    nums = re.findall(r'[-+]?\d*\.?\d+', val_clean)
-    if nums:
-        return float(nums[0])
-    return None
-
 def process_hourly_result(hour_data, data_source_label, standard_choice, fallback_mode=False):
-    """Processes a single hour's data, either from scraper or fallback calculation."""
     is_acgih = "ACGIH" in standard_choice
-    limit_key = "ACGIH_TLV_F" if is_acgih else "NIOSH_REL_F"
-    alert_key = "ACGIH_AL_F" if is_acgih else "NIOSH_RAL_F"
-    limit_name = "TLV" if is_acgih else "REL"
-    alert_name = "AL" if is_acgih else "RAL"
+    limit_key, alert_key = ("ACGIH_TLV_F", "ACGIH_AL_F") if is_acgih else ("NIOSH_REL_F", "NIOSH_RAL_F")
+    limit_name, alert_name = ("TLV", "AL") if is_acgih else ("REL", "RAL")
 
     if hour_data.get("skip_calc", False):
-        row_dict = {
-            "Date": hour_data["date_string_final"], "Time": hour_data["time_display"], 
-            "Air_Temp_F": hour_data.get('temperature_f', "N/A"), "Humidity_Pct": hour_data.get('relative_humidity_percent', "N/A"),
-            "Wind_Speed_mph": hour_data.get('wind_speed_mph', "N/A"), "Barometric_Pressure_inHg": hour_data.get('barometric_pressure_inhg', "N/A"),
-            "Sun_WBGT_F": "N/A", "Shade_WBGT_F": "N/A", "Workload": hour_data["workload_label"], "Adjusted_Watts": hour_data["final_watts"]
-        }
-        row_dict[limit_key] = "N/A"; row_dict[alert_key] = "N/A"
-        row_dict["Safety_Status"] = "Data Missing"; row_dict["Weather_Data_Source"] = data_source_label
-        row_dict["Notes"] = hour_data.get("note_additions", "Key variables missing.")
-        return row_dict
+        row = {k: "N/A" for k in ["Air_Temp_F", "Humidity_Pct", "Wind_Speed_mph", "Barometric_Pressure_inHg", "Sun_WBGT_F", "Shade_WBGT_F", limit_key, alert_key]}
+        row.update({"Date": hour_data["date_string_final"], "Time": hour_data["time_display"], "Workload": hour_data["workload_label"], "Adjusted_Watts": hour_data["final_watts"], "Safety_Status": "Data Missing", "Weather_Data_Source": data_source_label, "Notes": hour_data.get("note_additions", "Key variables missing.")})
+        return row
 
-    orig_temp = float(hour_data['temperature_f'])
-    orig_rh = int(hour_data['relative_humidity_percent'])
-    orig_ws = float(hour_data['wind_speed_mph'])
-    orig_pres = float(hour_data['barometric_pressure_inhg'])
-    
-    sun_f, shade_f = 0.0, 0.0
-    notes_list = []
-    if "note_additions" in hour_data and hour_data["note_additions"]:
-        notes_list.append(hour_data["note_additions"])
-    if st.session_state.location_fallback: notes_list.append("City/State/Zip used (exact location unresolved)")
-    if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
+    temp, rh, ws, pres = [hour_data.get(k) for k in ['temperature_f', 'relative_humidity_percent', 'wind_speed_mph', 'barometric_pressure_inhg']]
+    notes = [hour_data.get("note_additions", "")]
+    if st.session_state.location_fallback: notes.append("City/State/Zip used")
+    if st.session_state.use_caf: notes.append(f"CAF Applied: {st.session_state.caf_label}")
 
     if fallback_mode:
-        sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour_data['hour_24h'], is_sun=True)
-        shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour_data['hour_24h'], is_sun=False)
-        notes_list.append("Offline Stull Fallback Used")
+        st.session_state.fallback_active = True
+        sun_f = calculate_wbgt_meteorological_fallback(temp, rh, ws, hour_data['hour_24h'], True)
+        shade_f = calculate_wbgt_meteorological_fallback(temp, rh, ws, hour_data['hour_24h'], False)
+        notes.append("Offline Stull Fallback Used")
     else:
-        sun_f = hour_data['sun_f']
-        shade_f = hour_data['shade_f']
-        if "clamp_notes" in hour_data:
-            notes_list.extend(hour_data['clamp_notes'])
+        sun_f, shade_f = hour_data['sun_f'], hour_data['shade_f']
+        if "clamp_notes" in hour_data: notes.extend(hour_data['clamp_notes'])
 
     if st.session_state.use_caf:
         sun_f = round(sun_f + st.session_state.caf_value, 1)
         shade_f = round(shade_f + st.session_state.caf_value, 1)
 
-    adjusted_watts = hour_data["final_watts"]
-    limit_c = 56.7 - (11.5 * math.log10(adjusted_watts))
-    alert_c = 59.9 - (14.1 * math.log10(adjusted_watts))
-    limit_f = round((limit_c * 1.8) + 32, 1)
-    alert_f = round((alert_c * 1.8) + 32, 1)
-
+    adj_watts = hour_data["final_watts"]
+    limit_f = round(((56.7 - 11.5 * math.log10(adj_watts)) * 1.8) + 32, 1)
+    alert_f = round(((59.9 - 14.1 * math.log10(adj_watts)) * 1.8) + 32, 1)
     status = "Normal"
     if sun_f > limit_f or shade_f > limit_f: status = f"BREACH: {limit_name}"
     elif sun_f > alert_f or shade_f > alert_f: status = f"WARNING: {alert_name}"
     
-    notes_str = " | ".join(notes_list) if notes_list else "None"
-
-    row_dict = {
-        "Date": hour_data["date_string_final"], "Time": hour_data["time_display"], 
-        "Air_Temp_F": orig_temp, "Humidity_Pct": orig_rh, "Wind_Speed_mph": orig_ws, "Barometric_Pressure_inHg": orig_pres,
-        "Sun_WBGT_F": sun_f, "Shade_WBGT_F": shade_f, "Workload": hour_data["workload_label"], "Adjusted_Watts": adjusted_watts
-    }
-    row_dict[limit_key] = limit_f; row_dict[alert_key] = alert_f
-    row_dict["Safety_Status"] = status; row_dict["Weather_Data_Source"] = data_source_label
-    row_dict["Notes"] = notes_str
-    
-    return row_dict
+    return {"Date": hour_data["date_string_final"], "Time": hour_data["time_display"], "Air_Temp_F": temp, "Humidity_Pct": rh, "Wind_Speed_mph": ws, "Barometric_Pressure_inHg": pres, "Sun_WBGT_F": sun_f, "Shade_WBGT_F": shade_f, "Workload": hour_data["workload_label"], "Adjusted_Watts": adj_watts, limit_key: limit_f, alert_key: alert_f, "Safety_Status": status, "Weather_Data_Source": data_source_label, "Notes": " | ".join(filter(None, notes))}
 
 # =====================================================================
-# WEB AUTOMATION BACKEND ENGINE
+# CORRECTED WEB AUTOMATION ENGINE (FIXED LONGITUDE_ABSOLUTE KEY)
 # =====================================================================
 def run_browser_automation(hourly_data, data_source_label, standard_choice):
-    computed_results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    computed_results, progress_bar, status_text = [], st.progress(0), st.empty()
     st.session_state.fallback_active = False
-    
     try:
         with sync_playwright() as p:
-            status_text.text("Launching headless browser context...")
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            status_text.text("Navigating to OSHA WBGT Calculator...")
+            page.goto("https://www.osha.gov/heat-exposure/wbgt-calculator", wait_until="load", timeout=25000)
             
-            # Extract the correct localized IANA timezone string (e.g. "America/New_York")
-            target_tz = hourly_data[0].get("tz_name", "UTC") if hourly_data else "UTC"
+            frame_locator = page.frame_locator('iframe[src*="advanced-wbgt-calculator.html"]')
+            if not frame_locator.first.is_visible(timeout=10000):
+                raise Exception("Could not find calculator iframe.")
+            frame = frame_locator.first
 
-            # We add ignore_https_errors to ensure VPNs/Firewalls don't block Playwright
-            browser = p.chromium.launch(
-                headless=True, 
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
-            )
-            
-            # CRITICAL INJECTION: The timezone_id parameter forces Playwright's local clock to align
-            # with the coordinates being requested, ensuring solar zenith angle mathematics operate correctly.
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                ignore_https_errors=True,
-                timezone_id=target_tz
-            )
-            page = context.new_page()
-            
-            target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
-            status_text.text("Navigating to OSHA Calculator (this may take a moment)...")
-            
-            try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as nav_e:
-                status_text.text("Navigation soft-timeout, attempting aggressive load...")
-                page.goto(target_url, timeout=30000)
-                
-            page.wait_for_timeout(2000)
-            status_text.text("Locating calculator frame...")
-            
-            target_frame = None
-            for _ in range(20):
-                for frame in page.frames:
-                    try:
-                        if frame.locator('input[name="temp"]').count() > 0:
-                            target_frame = frame
-                            break
-                    except Exception:
-                        pass
-                if target_frame:
-                    break
-                try:
-                    if page.locator('input[name="temp"]').count() > 0:
-                        target_frame = page
-                        break
-                except Exception:
-                    pass
-                page.wait_for_timeout(500)
-
-            if not target_frame:
-                target_frame = page
-
-            total_rows = len(hourly_data)
             for index, hour in enumerate(hourly_data):
-                status_text.text(f"Scraping OSHA Calculator for hour: {hour['time_display']} ({index+1}/{total_rows})...")
-                progress_bar.progress((index) / total_rows)
-                
+                progress_bar.progress((index + 1) / len(hourly_data))
+                status_text.text(f"Processing Hour: {hour['time_display']} ({index+1}/{len(hourly_data)})")
                 if hour.get("skip_calc", False):
                     computed_results.append(process_hourly_result(hour, data_source_label, standard_choice))
                     continue
                 
                 row_fallback = False
-                sun_f, shade_f = 0.0, 0.0
-                
-                orig_temp = float(hour['temperature_f'])
-                orig_rh = int(hour['relative_humidity_percent'])
-                orig_ws = float(hour['wind_speed_mph'])
-                orig_pres = float(hour['barometric_pressure_inhg'])
-                
-                safe_temp = max(min(orig_temp, 120.0), 32.0)
-                safe_rh = max(min(orig_rh, 100), 1)
-                safe_ws = max(min(orig_ws, 50.0), 0.0)
-                safe_pres = max(min(orig_pres, 32.0), 25.0)
-                
-                clamp_notes = []
-                if orig_temp < 32.0: clamp_notes.append("Air Temp clamped up to 32.0 °F")
-                elif orig_temp > 120.0: clamp_notes.append("Air Temp clamped down to 120.0 °F")
-                if orig_rh < 1: clamp_notes.append("RH clamped up to 1%")
-                elif orig_rh > 100: clamp_notes.append("RH clamped down to 100%")
-                hour['clamp_notes'] = clamp_notes
-                
                 try:
-                    calculator_time = hour.get("calculator_time", f"{hour['hour_24h']:02d}:00")
-                    target_frame.locator('input[name="dd"]').fill(str(hour["date_string_final"]))
-                    target_frame.locator('input[name="tm"]').fill(calculator_time)
-                    target_frame.locator('input[name="lat"]').fill(str(hour["latitude"]))
-                    target_frame.locator('input[name="lon"]').fill(str(hour["longitude_absolute"]))
+                    temp, rh, ws, pres = [hour.get(k) for k in ['temperature_f', 'relative_humidity_percent', 'wind_speed_mph', 'barometric_pressure_inhg']]
+                    safe_temp, safe_rh, safe_ws, safe_pres = max(min(temp, 120.0), 32.0), max(min(rh, 100), 1), max(min(ws, 50.0), 0.0), max(min(pres, 32.0), 25.0)
+                    hour['clamp_notes'] = [f"{n} clamped" for v, s_v, n in [(temp,safe_temp,"Temp"), (rh,safe_rh,"RH")] if v!=s_v]
+
+                    frame.fill('input[name="dd"]', hour["date_string_final"])
+                    frame.fill('input[name="tm"]', hour.get("calculator_time", f"{hour['hour_24h']:02d}:00"))
+                    frame.fill('input[name="lat"]', str(hour["latitude"]))
+                    # FIXED LINE: Uses "longitude_absolute" which is correctly generated in Step 1 geocoding/NOAA functions
+                    frame.fill('input[name="lon"]', str(hour["longitude_absolute"]))
+                    frame.select_option('select[name="tz"]', value=hour["tz_value"])
+                    frame.fill('input[name="temp"]', str(safe_temp))
+                    frame.fill('input[name="rh"]', str(safe_rh))
+                    frame.fill('input[name="ws"]', str(safe_ws))
+                    frame.fill('input[name="pres"]', str(safe_pres))
                     
-                    target_frame.locator('input[name="temp"]').fill(str(safe_temp))
-                    target_frame.locator('input[name="rh"]').fill(str(safe_rh))
-                    target_frame.locator('input[name="ws"]').fill(str(safe_ws))
-                    target_frame.locator('input[name="pres"]').fill(str(safe_pres))
+                    frame.click('input[value="Submit"]')
+                    expect(frame.locator('input[name="wbgt_sun"]')).to_contain("/", timeout=15000)
                     
-                    try:
-                        # Attempt strict string match for dropdown option (e.g. "-5")
-                        target_frame.locator('select[name="tz"]').select_option(value=str(hour["tz_value"]), timeout=1500)
-                    except Exception:
-                        try:
-                            # Attempt float match fallback (e.g. "-5.0")
-                            target_frame.locator('select[name="tz"]').select_option(value=f"{float(hour['tz_value'])}", timeout=1000)
-                        except Exception:
-                            pass
-                    
-                    page.wait_for_timeout(250)
-                    
-                    submit_btn = target_frame.locator('input[value="Submit"]')
-                    if submit_btn.count() > 0:
-                        submit_btn.click(force=True)
-                    else:
-                        submit_btn2 = target_frame.locator('input[type="submit"]')
-                        if submit_btn2.count() > 0:
-                            submit_btn2.click(force=True)
-                        else:
-                            target_frame.locator('button', has_text='Submit').click(force=True)
-                    
-                    fetched_success = False
-                    for _ in range(40):
-                        page.wait_for_timeout(250)
-                        live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
-                        if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
-                            live_shade_val = target_frame.locator('input[name="wbgt_shade"]').input_value()
-                            parsed_sun = parse_wbgt_val(live_sun_val)
-                            parsed_shade = parse_wbgt_val(live_shade_val)
-                            if parsed_sun is not None and parsed_shade is not None:
-                                sun_f = parsed_sun
-                                shade_f = parsed_shade
-                                fetched_success = True
-                                break
-                    
-                    if not fetched_success:
+                    sun_val, shade_val = frame.locator('input[name="wbgt_sun"]').input_value(), frame.locator('input[name="wbgt_shade"]').input_value()
+                    if "/" in sun_val:
+                        hour['sun_f'] = float(sun_val.split('/')[1].strip()[:-1])
+                        hour['shade_f'] = float(shade_val.split('/')[1].strip()[:-1])
+                    else: 
                         row_fallback = True
                 except Exception as e:
                     row_fallback = True
-                    hour['note_additions'] = (str(hour.get('note_additions', '')) + f" | Scraper error: {str(e)}").strip(" | ")
-                
-                hour['sun_f'] = sun_f
-                hour['shade_f'] = shade_f
                 
                 computed_results.append(process_hourly_result(hour, data_source_label, standard_choice, fallback_mode=row_fallback))
-                
             browser.close()
-            
     except Exception as e:
-        st.error(f"⚠️ Playwright Browser Automation Error: {str(e)}")
-        st.warning("The application caught a critical failure in the headless browser startup and automatically applied the offline Stull's equation fallback to ensure results were still generated.")
-        st.session_state.fallback_active = True
-        computed_results = [process_hourly_result(h, data_source_label, standard_choice, fallback_mode=True) for h in hourly_data]
-
-    progress_bar.progress(1.0)
-    status_text.text("Processing operation completed.")
+        status_text.error(f"Browser automation failed: {e}. Using offline fallback for all hours.")
+        computed_results = [process_hourly_result(h, data_source_label, standard_choice, True) for h in hourly_data]
+    status_text.text("Processing completed successfully.")
     return computed_results
 
 # =====================================================================
-# MATPLOTLIB GRAPHICS COMPLIANCE GENERATOR
+# MATPLOTLIB COMPLIANCE GRAPH GENERATOR
 # =====================================================================
 def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_label, standard_choice):
     is_acgih = "ACGIH" in standard_choice
@@ -668,12 +334,12 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
     
     if use_caf:
         if x_watts:
-            ax.scatter(x_watts, y_sun, color='darkred', marker='d', s=130, zorder=5, label='Effective Sun WBGT (CAF-Adjusted)')
-            ax.scatter(x_watts, y_shade, color='darkblue', marker='p', s=120, zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
+            ax.scatter(x_watts, y_sun, color='darkred', marker='d', zorder=5, label='Effective Sun WBGT (CAF-Adjusted)')
+            ax.scatter(x_watts, y_shade, color='darkblue', marker='p', zorder=5, label='Effective Shade WBGT (CAF-Adjusted)')
     else:
         if x_watts:
-            ax.scatter(x_watts, y_sun, color='red', marker='o', s=120, zorder=5, label='Hourly Exposure (Sun WBGT)')
-            ax.scatter(x_watts, y_shade, color='blue', marker='s', s=100, zorder=5, label='Hourly Exposure (Shade WBGT)')
+            ax.scatter(x_watts, y_sun, color='red', marker='o', zorder=5, label='Hourly Exposure (Sun WBGT)')
+            ax.scatter(x_watts, y_shade, color='blue', marker='s', zorder=5, label='Hourly Exposure (Shade WBGT)')
     
     for r in results:
         if r["Sun_WBGT_F"] != "N/A":
@@ -701,11 +367,9 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
 @st.dialog("Confirm Target Location")
 def show_location_confirmation_dialog():
     geo = st.session_state.pending_geo
-    
     if not geo: return
         
-    st.write("Please confirm that the retrieved location matches your intended site before proceeding:")
-    
+    st.write("Please confirm that the retrieved location matches your site:")
     col_entered, col_matched = st.columns(2)
     with col_entered:
         st.markdown("**User Entered Location:**"); st.info(geo["raw_entered"])
@@ -713,9 +377,8 @@ def show_location_confirmation_dialog():
         st.markdown("**Retrieved / Geocoded Site:**"); st.success(geo["matched_address"])
         
     st.caption(f"📍 **Coordinates:** Latitude {geo['latitude']}, Longitude {geo['longitude']}")
-    
     if geo.get("fallback_used"):
-        st.warning("⚠️ Street address could not be specifically pinpointed. Geocoding fell back to City/State/ZIP center.")
+        st.warning("⚠️ Geocoding fell back to City/State/ZIP center.")
 
     col_confirm, col_edit = st.columns(2)
     with col_confirm:
@@ -728,11 +391,11 @@ def show_location_confirmation_dialog():
             worker_weight = geo["worker_weight"]
             date_str = target_date.strftime("%Y-%m-%d")
             
-            with st.spinner("Retrieving atmospheric matrices from Open-Meteo provider..."):
+            with st.spinner("Retrieving weather matrices..."):
                 weather_res = fetch_weather_native(geo["latitude"], geo["longitude"], date_str, st.session_state.is_forecast)
             
-            if "error" in weather_res or "hourly" not in weather_res or not weather_res["hourly"]:
-                st.error(weather_res.get("error", "Could not pull valid weather timeline matrices for this date/location."))
+            if "error" in weather_res or "hourly" not in weather_res:
+                st.error(weather_res.get("error", "Failed to retrieve weather data."))
             else:
                 hourly = weather_res["hourly"]
                 grid_lat = weather_res["grid_latitude"]; grid_lon = weather_res["grid_longitude"]
@@ -744,9 +407,6 @@ def show_location_confirmation_dialog():
                     "grid_lat": grid_lat, "grid_lon": grid_lon,
                     "distance_miles": dist_miles, "data_source": "Open-Meteo"
                 }
-                    
-                st.session_state.raw_weather_debug = weather_res.get("raw_debug", None)
-                st.session_state.raw_noaa_df_export = None
                 
                 active_rows = []
                 for i in range(len(hourly["time"])):
@@ -758,9 +418,8 @@ def show_location_confirmation_dialog():
                             "date_string_final": target_date.strftime("%m/%d/%Y"), "time_display": ampm, "hour_24h": hr_int,
                             "calculator_time": f"{hr_int:02d}:00", "skip_calc": False, "note_additions": "",
                             "latitude": geo["latitude"], "longitude": geo["longitude"],
-                            "longitude_absolute": abs(geo["longitude"]), 
+                            "longitude_absolute": abs(geo["longitude"]), # CRITICAL DATA BINDING KEY PASSED TO PLAYWRIGHT
                             "tz_value": get_tz_offset_from_coords(geo["latitude"], geo["longitude"], target_date),
-                            "tz_name": get_tz_name_from_coords(geo["latitude"], geo["longitude"]),
                             "temperature_f": hourly["temperature_2m"][i], 
                             "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
                             "wind_speed_mph": hourly["wind_speed_10m"][i], 
@@ -789,7 +448,7 @@ st.session_state.is_forecast = st.toggle(
 
 if st.session_state.is_forecast:
     st.title("🌤️ OSHA-WBGT Predictive Forecast Calculator")
-    st.warning("**LEGAL DISCLAIMER & WARNING:** This tool is currently utilizing *forecasted* meteorological models for future planning. Weather conditions are inherently dynamic and can shift rapidly. These predictions may not perfectly reflect actual micro-climate conditions on site. Employers must not rely solely on this forecast; on-site environmental monitoring and situational awareness remain mandatory to ensure worker safety and compliance. This output is for preliminary hazard planning purposes only.")
+    st.warning("⚠️ **FORECAST WARNING:** This tool uses forecast models for future planning. On-site environmental tracking remains mandatory.")
 else:
     st.title("☀️ OSHA-WBGT Localized Calculator")
 
@@ -804,20 +463,20 @@ with st.expander("📚 Methodology, Data Sources & About the Author"):
     ### 🌤️ Weather Data & Meteorological Modeling
     After establishing coordinates, the application uses one of two methods for weather data:
     1.  **Open-Meteo API:** For both historical and future forecast data, the app interfaces with the Open-Meteo API. 
-        - **Historical Mode:** Uses the ERA5 global reanalysis dataset, which combines vast amounts of historical weather observations into a comprehensive, physically consistent model of the Earth's climate.
-        - **Forecast Mode:** Uses a blend of leading forecast models like NOAA's GFS and HRRR for short-to-medium-term predictions.
-    2.  **NOAA Local CSV Upload:** Users can upload a CSV file from the NOAA NCEI database. The application intelligently parses this data, using the station's coordinates to determine the local time zone and automatically handle Daylight Saving Time (DST) for the given date. It identifies the most relevant weather reading within a +/- 10-minute window of each hour.
+        - **Historical Mode:** Uses the ERA5 global reanalysis dataset.
+        - **Forecast Mode:** Uses a blend of leading forecast models like NOAA's GFS and HRRR.
+    2.  **NOAA Local CSV Upload:** Users can upload a CSV file from the NOAA NCEI database. The application intelligently parses this data, using the station's coordinates to determine the local time zone and automatically handle Daylight Saving Time (DST) for the given date.
 
     ### 🤖 Automation and Fallback Logic
-    The application automates data entry into the official **[OSHA WBGT Calculator](https://www.osha.gov/heat-exposure/wbgt-calculator)**. Using a headless browser, it submits the weather data for each hour and scrapes the resulting WBGT values. If the OSHA website is unreachable or the process fails, a built-in **Stull's Equation Fallback** is automatically triggered to estimate the WBGT based on meteorological principles, ensuring a result is always provided.
+    The application automates data entry into the official **[OSHA WBGT Calculator](https://www.osha.gov/heat-exposure/wbgt-calculator)**. Using a headless browser, it submits the weather data for each hour and scrapes the resulting WBGT values. If the OSHA website is unreachable or the process fails, a built-in **Stull's Equation Fallback** is automatically triggered to estimate the WBGT based on meteorological principles.
 
     ### ⚖️ Workload Calculation
-    Worker metabolism is a key factor in heat stress. The app calculates this using two methods:
-    1.  **Standard Method:** Users select a workload (Light, Moderate, etc.). The base wattage for that category is then adjusted proportionally based on the worker's weight relative to a standard 154 lb (70 kg) reference.
-    2.  **Advanced Clinical Method:** Users can input a specific Metabolic Equivalent (MET) value. The app then converts this to watts, with options to use a standard formula or a more precise calculation based on the worker's individual biometrics (age, sex, height) via the Mifflin-St Jeor equation for Resting Metabolic Rate.
+    Worker metabolism is calculated using two methods:
+    1.  **Standard Method:** Users select a workload (Light, Moderate, etc.). The base wattage is then adjusted proportionally based on the worker's weight relative to a standard 154 lb (70 kg) reference.
+    2.  **Advanced Clinical Method:** Users can input a specific MET value. The app converts this to watts, with options to use a standard formula or a more precise calculation based on the worker's individual biometrics (age, sex, height) via the Mifflin-St Jeor equation.
 
     ### 👨‍🔬 About the Developer
-    **Andre Taylor** is a Health Scientist for the Occupational Safety and Health Administration (OSHA) and a leading Subject Matter Expert (SME) on workplace heat exposure, physiological hazard assessments, and industrial mitigation strategies. Bringing over 20 years of foundational nursing experience to his role alongside a prominent background as a Compliance Safety and Health Officer (CSHO), Andre bridges the critical operational gap between clinical health sciences and practical, on-the-ground occupational safety. As an established process improvement specialist, data scientist, and AI developer, he is deeply dedicated to engineering modernized, high-efficiency regulatory tools that empower safety professionals to better protect worker health.
+    **Andre Taylor** is a Health Scientist for the Occupational Safety and Health Administration (OSHA) and a leading Subject Matter Expert (SME) on workplace heat exposure, physiological hazard assessments, and industrial mitigation strategies. Andre bridges the critical operational gap between clinical health sciences and practical, on-the-ground occupational safety.
     """)
 
 mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY", "") if hasattr(st, "secrets") else "")
@@ -825,11 +484,10 @@ mapbox_secret = os.environ.get("MAPBOX_API_KEY", st.secrets.get("MAPBOX_API_KEY"
 if st.session_state.pending_geo is not None:
     show_location_confirmation_dialog()
 
-# --- WIZARD STEP 1: UI-BASED TARGET PARAMETER INPUTS ---
+# --- WIZARD STEP 1: TARGET PARAMETER INPUTS ---
 if st.session_state.step == 1:
     st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
-    st.markdown("**Meteorological Data Provider**")
     noaa_disabled = st.session_state.is_forecast
     if noaa_disabled:
         data_source_index = 0
@@ -845,9 +503,9 @@ if st.session_state.step == 1:
     use_gps = False; uploaded_noaa_csv = None
     
     if "NOAA" in data_source and not noaa_disabled:
-        st.info("💡 **NOAA Local Climatological Data (LCD):** Upload a CSV dataset downloaded from the NOAA NCEI tool. The application will automatically extract GPS coordinates and timeline details from the file.")
+        st.info("💡 **NOAA Local Climatological Data:** Upload a CSV dataset downloaded from the NOAA NCEI tool.")
         uploaded_noaa_csv = st.file_uploader("Upload NOAA LCD Weather File (.csv)", type=["csv"])
-    elif "Open-Meteo" in data_source or noaa_disabled:
+    else:
         col_loc_header, col_loc_toggle = st.columns([3, 1])
         with col_loc_header: st.markdown("**Location Details**")
         with col_loc_toggle: use_gps = st.toggle("Use GPS Coordinates", value=False)
@@ -873,14 +531,14 @@ if st.session_state.step == 1:
         else:
             target_date = st.date_input("Inspection Date", value=today_date - timedelta(days=1), max_value=today_date)
             
-    with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours (24-Hour Clock)", min_value=0, max_value=23, value=(8, 16), format="%d:00")
+    with c_shift2: start_hour, end_hour = st.slider("Shift Operating Hours", min_value=0, max_value=23, value=(8, 16), format="%d:00")
     with c_shift3: worker_weight = st.number_input("Employee Weight (lbs)", min_value=50.0, max_value=400.0, value=154.0, step=1.0)
     
     if st.button("Process Weather Data", type="primary"):
         if "NOAA" in data_source and not noaa_disabled:
-            if uploaded_noaa_csv is None: st.error("Please upload a NOAA CSV file before proceeding.")
+            if uploaded_noaa_csv is None: st.error("Please upload a NOAA CSV file.")
             else:
-                with st.spinner("Processing NOAA CSV data..."):
+                with st.spinner("Processing NOAA CSV..."):
                     noaa_result = process_weather_noaa_csv(uploaded_noaa_csv, target_date, start_hour, end_hour)
                     if "error" in noaa_result: st.error(noaa_result["error"])
                     else:
@@ -896,7 +554,6 @@ if st.session_state.step == 1:
                                 "latitude": noaa_result["latitude"], "longitude": noaa_result["longitude"],
                                 "longitude_absolute": abs(noaa_result["longitude"]), 
                                 "tz_value": get_tz_offset_from_coords(noaa_result["latitude"], noaa_result["longitude"], target_date),
-                                "tz_name": get_tz_name_from_coords(noaa_result["latitude"], noaa_result["longitude"]),
                                 "temperature_f": hr_data["temperature_f"], "relative_humidity_percent": hr_data["relative_humidity_percent"], 
                                 "wind_speed_mph": hr_data["wind_speed_mph"], "barometric_pressure_inhg": hr_data["barometric_pressure_inhg"]
                             })
@@ -908,14 +565,14 @@ if st.session_state.step == 1:
                             "data_source": "NOAA Station Data (Local CSV Upload)", "station_name": noaa_result["station_name"]
                         }
                         
-                        st.session_state.raw_noaa_df_export = noaa_result["raw_noaa_df"]
+                        st.session_state.raw_noaa_df_export = None
                         st.session_state.raw_weather_debug = None
                         st.session_state.final_hourly_rows = active_rows
                         st.session_state.worker_weight = worker_weight
                         st.session_state.location_fallback = False
                         st.session_state.step = 2
                         st.rerun()
-        elif "Open-Meteo" in data_source or noaa_disabled:
+        else:
             if use_gps:
                 try:
                     lat_val = float(target_lat_in); lon_val = float(target_lon_in)
@@ -925,46 +582,36 @@ if st.session_state.step == 1:
                         "shift_hours": (start_hour, end_hour), "worker_weight": worker_weight, "data_source": data_source
                     }
                     st.rerun()
-                except ValueError: st.error("Please enter valid numerical values for Latitude and Longitude.")
+                except ValueError: st.error("Please enter valid decimal coordinates.")
             else:
-                if not target_city.strip() and not target_zip.strip() and not target_street.strip():
-                    st.warning("Please supply at least a City/State, ZIP Code, or Street Address.")
-                else:
-                    with st.spinner("Resolving location coordinates..."):
-                        geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
-                        
-                        if "error" in geo: st.error(geo["error"])
-                        else:
-                            st.session_state.pending_geo = {
-                                "latitude": geo["latitude"], "longitude": geo["longitude"],
-                                "matched_address": geo.get("matched_address", raw_entered_address), "raw_entered": raw_entered_address,
-                                "fallback_used": fallback_used and bool(target_street.strip()), "target_date": target_date,
-                                "shift_hours": (start_hour, end_hour), "worker_weight": worker_weight, "data_source": data_source
-                            }
-                            st.rerun()
+                with st.spinner("Resolving location coordinates..."):
+                    geo, fallback_used, raw_entered_address = resolve_location(target_street, target_city, target_state, target_zip, mapbox_secret)
+                    if "error" in geo: st.error(geo["error"])
+                    else:
+                        st.session_state.pending_geo = {
+                            "latitude": geo["latitude"], "longitude": geo["longitude"],
+                            "matched_address": geo.get("matched_address", raw_entered_address), "raw_entered": raw_entered_address,
+                            "fallback_used": fallback_used and bool(target_street.strip()), "target_date": target_date,
+                            "shift_hours": (start_hour, end_hour), "worker_weight": worker_weight, "data_source": data_source
+                        }
+                        st.rerun()
 
-# --- WIZARD STEP 2: DYNAMIC HOURLY WORKLOAD DESIGNER ---
+# --- WIZARD STEP 2: METABOLISM & WORKLOADS ---
 elif st.session_state.step == 2:
     st.subheader("Step 2: Assign Hourly Worker Metabolism / Workloads")
     
-    st.markdown("### Heat Stress Standard")
-    standard_choice = st.radio("Select Evaluation Standard", ["NIOSH (Default)", "ACGIH (Requires Permission)"], help="NIOSH values are public domain. ACGIH values are copyrighted intellectual property.")
+    standard_choice = st.radio("Select Evaluation Standard", ["NIOSH (Default)", "ACGIH (Requires Permission)"])
     st.session_state.standard_choice = standard_choice
     
-    if "ACGIH" in standard_choice:
-        st.warning("**LEGAL DISCLAIMER:** TLVs® and BEIs® are copyrighted property of the American Conference of Governmental Industrial Hygienists (ACGIH®). This application is not endorsed by, sponsored by, or affiliated with ACGIH. This toggle is included for internal testing and pending formal permission.")
-    
-    st.markdown("### Clothing & PPE Adjustment Factor (Optional)")
     use_caf = st.toggle("Apply Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
     caf_value = 0.0; caf_label = "Standard Work Clothes (0.0 °F)"
-    
     if use_caf:
         caf_dict = {"Short sleeves and pants (-1.8 °F)": -1.8, "Work clothes / Cloth coveralls (0.0 °F)": 0.0,
                     "SMS polypropylene coveralls (+0.9 °F)": 0.9, "Polyolefin coveralls (+1.8 °F)": 1.8,
                     "Double-layer woven clothing (+5.4 °F)": 5.4, "Limited-use vapor-barrier coveralls (+19.8 °F)": 19.8}
         caf_choice = st.selectbox("Select Clothing Ensemble / PPE Type", list(caf_dict.keys()))
         caf_value = caf_dict[caf_choice]; caf_label = caf_choice
-        st.info(f"ℹ️ Active CAF Correction: **{caf_value:+.1f} °F** will be added to the calculated WBGT values.")
+        st.info(f"ℹ️ Active CAF Correction: **{caf_value:+.1f} °F** added to WBGT.")
         
     st.session_state.use_caf = use_caf
     st.session_state.caf_value = caf_value
@@ -972,22 +619,17 @@ elif st.session_state.step == 2:
     
     st.divider()
     use_clinical = st.toggle("Advanced Clinical / Custom Workload", value=False)
-    
     account_for_weight = True; clinical_method = "Standard Ainsworth (Weight Only)"; sex = "Male"; age = 35; height_in = 70.0
     
     if use_clinical:
-        st.info("Clinical Mode Active: Enter specific Ainsworth MET values for each hour below.")
         account_for_weight = st.toggle("Account for employee physiological data?", value=True)
         if account_for_weight:
-            clinical_method = st.radio("Metabolic Calculation Method", ["Standard Ainsworth (Weight Only)", "Corrected METs (Mifflin-St Jeor)"], help="Standard uses a flat 1 kcal/kg/hr baseline. Corrected uses the clinical Mifflin-St Jeor equation for precise Resting Metabolic Rate.")
+            clinical_method = st.radio("Metabolic Calculation Method", ["Standard Ainsworth (Weight Only)", "Corrected METs (Mifflin-St Jeor)"])
             if clinical_method == "Corrected METs (Mifflin-St Jeor)":
-                st.markdown("**Enter Worker Biometrics:**")
                 c_bio1, c_bio2, c_bio3 = st.columns(3)
                 sex = c_bio1.selectbox("Biological Sex", ["Male", "Female"])
-                age = c_bio2.number_input("Age (Years)", min_value=18, max_value=100, value=35)
+                age = c_bio2.number_input("Age", min_value=18, max_value=100, value=35)
                 height_in = c_bio3.number_input("Height (Inches)", min_value=40.0, max_value=90.0, value=70.0)
-    
-    st.divider()
     
     preset_map = {"Light (180W)": 180, "Moderate (300W)": 300, "Heavy (415W)": 415, "Very Heavy (520W)": 520}
     selections = {}
@@ -1031,10 +673,7 @@ elif st.session_state.step == 2:
                 
             with st.spinner("Executing calculations..."):
                 data_source_val = st.session_state.location_meta.get("data_source", "Open-Meteo")
-                if "NOAA" in data_source_val:
-                    data_source_label = f"NOAA LCD Station Data ({st.session_state.location_meta.get('station_name', 'Unknown')})"
-                else:
-                    data_source_label = "Open-Meteo Forecast (NOAA HRRR/GFS)" if st.session_state.is_forecast else "Open-Meteo Archive (ERA5 Reanalysis)"
+                data_source_label = "Open-Meteo Forecast" if st.session_state.is_forecast else "Open-Meteo Archive"
                 results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
                 
             if results:
@@ -1042,38 +681,29 @@ elif st.session_state.step == 2:
                 st.session_state.step = 3
                 st.rerun()
 
-    st.divider()
-    if st.session_state.raw_weather_debug:
-        with st.expander("🔍 Raw Meteorological Data Diagnostics", expanded=False):
-            st.json(st.session_state.raw_weather_debug)
-
-# --- WIZARD STEP 3: INTERACTIVE REPORT VIEWER & EXPORT ---
+# --- WIZARD STEP 3: RESULTS & SPREADSHEET EXPORT ---
 elif st.session_state.step == 3:
     st.subheader("Step 3: Compliance Engineering Summary Analysis Output")
     
     if st.session_state.get("fallback_active", False):
-        st.warning("⚠️ **Playwright Fallback Active**: The system successfully estimated WBGT offline utilizing Stull's equation.")
+        st.warning("⚠️ **Playwright Fallback Active**: Stull's equation was used to estimate WBGT offline.")
     else: 
-        st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully via OSHA Calculator.")
+        st.success("✅ Wet Bulb Globe Temperature (WBGT) data successfully scraped from OSHA.")
         
     meta = st.session_state.get("location_meta", {})
     if meta:
-        station_info = f"\n* **NOAA LCD Weather Station:** {meta.get('station_name')}" if "station_name" in meta else ""
         st.info(f"📍 **Address Audit Trail:**\n"
                 f"* **Entered Location:** {meta.get('user_entered', 'N/A')}\n"
-                f"* **Validated/Geocoded Location:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})\n"
-                f"* **Weather Point:** Lat {meta.get('grid_lat')}, Lon {meta.get('grid_lon')}{station_info}\n"
-                f"* **Distance to Weather Data Point:** **{meta.get('distance_miles', 0.0):.2f} miles**")
+                f"* **Validated/Geocoded Location:** {meta.get('validated', 'N/A')} (Lat: {meta.get('target_lat')}, Lon: {meta.get('target_lon')})")
         
     fig = generate_compliance_plot(st.session_state.results, st.session_state.worker_weight, st.session_state.is_forecast, 
                                    st.session_state.use_caf, st.session_state.caf_label, st.session_state.standard_choice)
     st.pyplot(fig)
     
-    st.subheader("Raw Exposure Tracking Metrics Matrix")
     df_results = pd.DataFrame(st.session_state.results)
     st.dataframe(df_results, use_container_width=True)
     
-    file_date_str = datetime.strptime(st.session_state.results[0]["Date"], "%m/%d/%Y").strftime("%Y%m%d") if st.session_state.results else datetime.now().strftime("%Y%m%d")
+    file_date_str = datetime.now().strftime("%Y%m%d")
     
     img_buffer = io.BytesIO(); fig.savefig(img_buffer, format="png", bbox_inches="tight", dpi=150); img_buffer.seek(0)
     excel_buffer = io.BytesIO()
@@ -1081,16 +711,13 @@ elif st.session_state.step == 3:
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
         df_results.to_excel(writer, sheet_name="Exposure_Data", index=False)
         pd.DataFrame([meta]).to_excel(writer, sheet_name="Location_Details", index=False)
-        if st.session_state.raw_noaa_df_export is not None:
-            st.session_state.raw_noaa_df_export.to_excel(writer, sheet_name="Raw_NOAA_Data", index=False)
         
         exposure_sheet = writer.sheets["Exposure_Data"]
         excel_img = OpenPyxlImage(img_buffer); excel_img.width = 650; excel_img.height = 380
         exposure_sheet.add_image(excel_img, f"A{len(df_results) + 4}")
         
     excel_file_data = excel_buffer.getvalue()
-    
-    st.download_button(label="Download Compliance Report Spreadsheet (.XLSX)", data=excel_file_data, 
+    st.download_button(label="Download Compliance Report (.XLSX)", data=excel_file_data, 
                        file_name=f"Heat_Stress_Report_{file_date_str}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     
     st.divider()
