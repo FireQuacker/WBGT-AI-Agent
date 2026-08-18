@@ -799,7 +799,7 @@ def show_location_confirmation_dialog():
 # UI / STREAMLIT APP ENGINE
 # =====================================================================
 st.session_state.is_forecast = st.toggle(
-    "📅 Switch to Future Forecast Mode (For Planning & Prediction)", 
+    "📅 Switch to Future Forecast Mode (For Planning & Prediction, NOAA CSV Upload unavailable for this mode)", 
     value=st.session_state.get("is_forecast", False),
     disabled=(st.session_state.step > 1)
 )
@@ -847,7 +847,7 @@ if st.session_state.step == 1:
     st.subheader("Step 1: Set Target Parameters & Profile Matrix")
     
     st.markdown("**Meteorological Data Provider**")
-    data_source = st.radio("Select Provider:", ["Open-Meteo (Default/Free)", "NOAA Station Data (Local CSV Upload)"])
+    data_source = st.radio("Select Provider:", ["Open-Meteo (Default)", "NOAA Station Data (Local CSV Upload)"])
     
     use_gps = False
     uploaded_noaa_csv = None
