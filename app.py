@@ -20,19 +20,6 @@ import pytz
 from timezonefinder import TimezoneFinder
 
 # =====================================================================
-# ONE-TIME PLAYWRIGHT INSTALLER (PREVENTS RE-RUN LAG)
-# =====================================================================
-@st.cache_resource
-def install_browser_engine():
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "tzdata"], check=False)
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=False)
-    except Exception as e:
-        st.error(f"Background browser engine initialization warning: {e}")
-
-install_browser_engine()
-
-# =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
 # =====================================================================
 st.set_page_config(page_title="OSHA-WBGT Localized Calculator", layout="wide")
@@ -432,7 +419,6 @@ def process_hourly_result(hour_data, data_source_label, standard_choice, fallbac
     if st.session_state.use_caf: notes_list.append(f"CAF Applied: {st.session_state.caf_label}")
 
     if fallback_mode:
-        st.session_state.fallback_active = True
         sun_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour_data['hour_24h'], is_sun=True)
         shade_f = calculate_wbgt_meteorological_fallback(orig_temp, orig_rh, orig_ws, hour_data['hour_24h'], is_sun=False)
         notes_list.append("Offline Stull Fallback Used")
@@ -481,26 +467,31 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
     try:
         with sync_playwright() as p:
             status_text.text("Launching headless browser context...")
+            # We add ignore_https_errors to ensure VPNs/Firewalls don't instantly block Playwright
             browser = p.chromium.launch(
                 headless=True, 
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
             )
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                ignore_https_errors=True
             )
             page = context.new_page()
             
             target_url = "https://www.osha.gov/heat-exposure/wbgt-calculator"
+            status_text.text("Navigating to OSHA Calculator (this may take a moment)...")
+            
             try:
-                page.goto(target_url, wait_until="networkidle", timeout=30000)
-            except Exception:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as nav_e:
+                status_text.text("Navigation soft-timeout, attempting aggressive load...")
+                page.goto(target_url, timeout=30000)
                 
-            time.sleep(2.0)
+            page.wait_for_timeout(2000)
+            status_text.text("Locating calculator frame...")
             
             target_frame = None
-            start_frame_search = time.time()
-            while time.time() - start_frame_search < 10:
+            for _ in range(20):
                 for frame in page.frames:
                     try:
                         if frame.locator('input[name="temp"]').count() > 0:
@@ -510,10 +501,13 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                         pass
                 if target_frame:
                     break
-                if page.locator('input[name="temp"]').count() > 0:
-                    target_frame = page
-                    break
-                time.sleep(0.5)
+                try:
+                    if page.locator('input[name="temp"]').count() > 0:
+                        target_frame = page
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
 
             if not target_frame:
                 target_frame = page
@@ -564,17 +558,22 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     except Exception:
                         pass
                     
-                    time.sleep(0.2)
+                    page.wait_for_timeout(250)
                     
                     submit_btn = target_frame.locator('input[value="Submit"]')
                     if submit_btn.count() > 0:
-                        submit_btn.click()
+                        submit_btn.click(force=True)
                     else:
-                        target_frame.locator('input[type="submit"]').click()
+                        submit_btn2 = target_frame.locator('input[type="submit"]')
+                        if submit_btn2.count() > 0:
+                            submit_btn2.click(force=True)
+                        else:
+                            target_frame.locator('button', has_text='Submit').click(force=True)
                     
                     fetched_success = False
+                    # Loop using wait_for_timeout so Playwright can properly execute JS on the page
                     for _ in range(40):
-                        time.sleep(0.2)
+                        page.wait_for_timeout(250)
                         live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
                         if live_sun_val and live_sun_val != "---" and live_sun_val.strip() != "":
                             live_shade_val = target_frame.locator('input[name="wbgt_shade"]').input_value()
@@ -600,10 +599,14 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
             browser.close()
             
     except Exception as e:
+        # We explicitly throw a highly visible error so it doesn't fail silently
+        st.error(f"⚠️ Playwright Browser Automation Error: {str(e)}")
+        st.warning("The application caught a critical failure in the headless browser startup and automatically applied the offline Stull's equation fallback to ensure results were still generated.")
+        st.session_state.fallback_active = True
         computed_results = [process_hourly_result(h, data_source_label, standard_choice, fallback_mode=True) for h in hourly_data]
 
     progress_bar.progress(1.0)
-    status_text.text("Processing operation completed successfully.")
+    status_text.text("Processing operation completed.")
     return computed_results
 
 # =====================================================================
@@ -1032,7 +1035,7 @@ elif st.session_state.step == 3:
     if st.session_state.get("fallback_active", False):
         st.warning("⚠️ **Playwright Fallback Active**: The system successfully estimated WBGT offline utilizing Stull's equation.")
     else: 
-        st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully.")
+        st.success("✅ Wet Bulb Globe Temperature (WBGT) data compiled successfully via OSHA Calculator.")
         
     meta = st.session_state.get("location_meta", {})
     if meta:
