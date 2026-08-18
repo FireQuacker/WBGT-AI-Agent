@@ -1,8 +1,9 @@
-streamlit
-playwright==1.49.0
-pydantic
-matplotlib
-numpy
-pandas
-requests
-openpyxl
+streamlit>=1.35.0
+pandas>=2.2.0
+numpy>=1.26.0
+matplotlib>=3.8.0
+openpyxl>=3.1.2
+requests>=2.31.0
+playwright>=1.42.0
+timezonefinder>=6.5.0
+pytz>=2024.1
