@@ -70,8 +70,14 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return round(R * c, 2)
 
+def get_tz_name_from_coords(lat: float, lon: float) -> str:
+    """Gets the IANA Timezone string for context injection (e.g., 'America/New_York')."""
+    tf = get_timezone_finder()
+    tz_name = tf.timezone_at(lng=lon, lat=lat)
+    return tz_name or "UTC"
+
 def get_tz_offset_from_coords(lat: float, lon: float, target_date: date) -> str:
-    """Gets the UTC offset as a string (e.g., '-5') for a given location and date."""
+    """Gets the UTC offset as a string (e.g., '-5' or '-4.5') for a given location and date."""
     tf = get_timezone_finder()
     tz_name = tf.timezone_at(lng=lon, lat=lat)
     
@@ -82,7 +88,7 @@ def get_tz_offset_from_coords(lat: float, lon: float, target_date: date) -> str:
         timezone = pytz.timezone(tz_name)
         dt_object = timezone.localize(datetime(target_date.year, target_date.month, target_date.day, 12))
         offset_hours = dt_object.utcoffset().total_seconds() / 3600
-        return str(int(offset_hours))
+        return str(int(offset_hours)) if offset_hours.is_integer() else str(offset_hours)
     except pytz.UnknownTimeZoneError:
         return str(round(lon / 15))
 
@@ -467,14 +473,22 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
     try:
         with sync_playwright() as p:
             status_text.text("Launching headless browser context...")
-            # We add ignore_https_errors to ensure VPNs/Firewalls don't instantly block Playwright
+            
+            # Extract the correct localized IANA timezone string (e.g. "America/New_York")
+            target_tz = hourly_data[0].get("tz_name", "UTC") if hourly_data else "UTC"
+
+            # We add ignore_https_errors to ensure VPNs/Firewalls don't block Playwright
             browser = p.chromium.launch(
                 headless=True, 
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
             )
+            
+            # CRITICAL INJECTION: The timezone_id parameter forces Playwright's local clock to align
+            # with the coordinates being requested, ensuring solar zenith angle mathematics operate correctly.
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                ignore_https_errors=True
+                ignore_https_errors=True,
+                timezone_id=target_tz
             )
             page = context.new_page()
             
@@ -554,9 +568,14 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                     target_frame.locator('input[name="pres"]').fill(str(safe_pres))
                     
                     try:
-                        target_frame.locator('select[name="tz"]').select_option(value=str(hour["tz_value"]), timeout=2000)
+                        # Attempt strict string match for dropdown option (e.g. "-5")
+                        target_frame.locator('select[name="tz"]').select_option(value=str(hour["tz_value"]), timeout=1500)
                     except Exception:
-                        pass
+                        try:
+                            # Attempt float match fallback (e.g. "-5.0")
+                            target_frame.locator('select[name="tz"]').select_option(value=f"{float(hour['tz_value'])}", timeout=1000)
+                        except Exception:
+                            pass
                     
                     page.wait_for_timeout(250)
                     
@@ -571,7 +590,6 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                             target_frame.locator('button', has_text='Submit').click(force=True)
                     
                     fetched_success = False
-                    # Loop using wait_for_timeout so Playwright can properly execute JS on the page
                     for _ in range(40):
                         page.wait_for_timeout(250)
                         live_sun_val = target_frame.locator('input[name="wbgt_sun"]').input_value()
@@ -599,7 +617,6 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
             browser.close()
             
     except Exception as e:
-        # We explicitly throw a highly visible error so it doesn't fail silently
         st.error(f"⚠️ Playwright Browser Automation Error: {str(e)}")
         st.warning("The application caught a critical failure in the headless browser startup and automatically applied the offline Stull's equation fallback to ensure results were still generated.")
         st.session_state.fallback_active = True
@@ -743,6 +760,7 @@ def show_location_confirmation_dialog():
                             "latitude": geo["latitude"], "longitude": geo["longitude"],
                             "longitude_absolute": abs(geo["longitude"]), 
                             "tz_value": get_tz_offset_from_coords(geo["latitude"], geo["longitude"], target_date),
+                            "tz_name": get_tz_name_from_coords(geo["latitude"], geo["longitude"]),
                             "temperature_f": hourly["temperature_2m"][i], 
                             "relative_humidity_percent": int(hourly["relative_humidity_2m"][i]), 
                             "wind_speed_mph": hourly["wind_speed_10m"][i], 
@@ -878,6 +896,7 @@ if st.session_state.step == 1:
                                 "latitude": noaa_result["latitude"], "longitude": noaa_result["longitude"],
                                 "longitude_absolute": abs(noaa_result["longitude"]), 
                                 "tz_value": get_tz_offset_from_coords(noaa_result["latitude"], noaa_result["longitude"], target_date),
+                                "tz_name": get_tz_name_from_coords(noaa_result["latitude"], noaa_result["longitude"]),
                                 "temperature_f": hr_data["temperature_f"], "relative_humidity_percent": hr_data["relative_humidity_percent"], 
                                 "wind_speed_mph": hr_data["wind_speed_mph"], "barometric_pressure_inhg": hr_data["barometric_pressure_inhg"]
                             })
