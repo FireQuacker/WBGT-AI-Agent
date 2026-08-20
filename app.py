@@ -813,6 +813,31 @@ else:
 st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
 st.divider()
 
+with st.expander("📖 How-To Guide: Running Heat Stress Assessments"):
+    st.markdown("""
+    ### Step 1: Enter Location and Date
+    1. **Choose your weather source**: Pick [Open-Meteo](https://open-meteo.com/) to use standard weather history or forecasts, or [NOAA Station Data](https://www.ncei.noaa.gov/maps/lcd/) if you have a local CSV weather file to upload.
+    2. **Type in your location**: Enter your street address, city, state, or ZIP code, or switch on the GPS option if you prefer exact coordinates. (If you uploaded a NOAA file, this happens automatically).
+    3. **Pick your shift details**: Select the date of your work or inspection, choose your working hours using the time slider, and enter the worker's weight.
+    4. **Load the data**: Click the process button to grab the weather details and check your site's location.
+
+    ---
+    ### Step 2: Set Work Levels and Clothing
+    1. **Pick your safety standard**: Choose between **NIOSH** (the standard default) or **ACGIH** guidelines.
+    2. **Clothing Adjustment Factors**: If workers are wearing special protective suits or heavy gear, turn on the clothing adjustment option, check the [Clothing Adjustment Factors](https://www.osha.gov/heat-exposure/hazards#ClothingAdjustmentFactors) reference guide, and pick the matching outfit type.
+    3. **Choose how hard people are working**: 
+       * **Standard mode**: Pick simple activity levels for each hour (like Light, Moderate, or Heavy) from the dropdowns.
+       * **Advanced mode**: If you prefer, enter specific metabolic energy values or worker details like age and height for a more tailored estimate.
+    4. **Run the calculation**: Click to start the analysis so the tool can run the numbers and check safety limits.
+
+    ---
+    ### Step 3: Review Results and Download Reports
+    1. **Check your details**: Look over the location summary to make sure the weather station and address match your site.
+    2. **View the safety chart**: Look at the chart to see how your shift's conditions compare against safe heat exposure limits.
+    3. **Read the hourly table and notes**: Check the table for a breakdown of temperatures, humidity, wind, and safety status for every hour of your shift. **Check the notes** column to find any additional notations, such as missing data, automated fallback alerts, or data substitutions.
+    4. **Save your report**: Click the download button to save a complete Excel spreadsheet containing all your data, notes, and safety charts for your records.
+    """)
+
 with st.expander("📚 Methodology, Data Sources & About the Author"):
     st.markdown("""
     ### 📍 Address Matching & Geocoding Pipeline
