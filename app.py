@@ -57,7 +57,7 @@ if "caf_value" not in st.session_state:
 if "caf_label" not in st.session_state:
     st.session_state.caf_label = "Standard Work Clothes (0.0 °F)"
 if "standard_choice" not in st.session_state:
-    st.session_state.standard_choice = "ACGIH (Default)"
+    st.session_state.standard_choice = "NIOSH (Default)"
 if "location_meta" not in st.session_state:
     st.session_state.location_meta = {}
 
@@ -154,12 +154,15 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     df['DATE_raw'] = pd.to_datetime(df['DATE'], errors='coerce')
     df = df.dropna(subset=['DATE_raw'])
     
+    # Apply DST Adjustment Pipeline (March - November)
     is_dst = df['DATE_raw'].dt.month.between(3, 11)
     df['DST_Adjusted_Time'] = df['DATE_raw'].copy()
     df.loc[is_dst, 'DST_Adjusted_Time'] = df['DATE_raw'] + pd.Timedelta(hours=1)
     
+    # Reassign parsed date reference to the Adjusted Time for structural alignment with the rounding/window search
     df['DATE_parsed'] = df['DST_Adjusted_Time']
     
+    # Filter the dataset roughly around our target date 
     target_dt_start = datetime.combine(target_date, datetime.min.time())
     target_dt_end = target_dt_start + timedelta(days=1)
     
@@ -169,6 +172,7 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
     if df_day.empty:
         return {"error": f"No data found in the CSV for the selected date ({target_date.strftime('%Y-%m-%d')}). Please verify the file covers this timeframe."}
         
+    # Extract coordinates directly from CSV
     lat = float(df_day['LATITUDE'].iloc[0]) if 'LATITUDE' in df_day.columns and not pd.isna(df_day['LATITUDE'].iloc[0]) else 0.0
     lon = float(df_day['LONGITUDE'].iloc[0]) if 'LONGITUDE' in df_day.columns and not pd.isna(df_day['LONGITUDE'].iloc[0]) else 0.0
     station_name = df_day['NAME'].iloc[0] if 'NAME' in df_day.columns and not pd.isna(df_day['NAME'].iloc[0]) else "NOAA Local CSV Station"
@@ -190,6 +194,7 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
         window_start = target_time - timedelta(minutes=10)
         window_end = target_time + timedelta(minutes=10)
         
+        # Filter rows to the +/- 10 minute window
         df_window = df_day[(df_day['DATE_parsed'] >= window_start) & (df_day['DATE_parsed'] <= window_end)].copy()
         
         note_additions = []
@@ -218,12 +223,14 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
             last_rh = None
             last_wind = None
             
+            # Check for critical missing variables
             if raw_t is None or rh_val is None or w_val is None:
                 note_additions.append("Key variables missing. Suggest a run with Open-Meteo.")
                 skip_calc = True
             
             if raw_t is not None:
-                if raw_t < 45.0:
+                # Temperature on NOAA CSV files is frequently in Celsius (°C). Validate and convert to °F if needed.
+                if raw_t < 45.0:  # Indicative of Celsius scale in ambient weather contexts
                     last_temp = round((raw_t * 1.8) + 32.0, 1)
                     note_additions.append(f"NOAA Temp {raw_t}°C converted to {last_temp}°F")
                 else:
@@ -241,6 +248,7 @@ def process_weather_noaa_csv(uploaded_file, target_date, start_hour, end_hour):
             matched_ts = str(best_row['DATE'])
             calc_time = best_row['DST_Adjusted_Time'].strftime('%H:%M')
             
+            # Populate raw export row for the 3rd tab
             raw_export_rows.append({
                 "Target_Date": target_date.strftime("%Y-%m-%d"),
                 "Target_Hour": f"{hr:02d}:00",
@@ -391,6 +399,7 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
                 status_text.text(f"Scraping OSHA Calculator for hour: {hour['time_display']} ({index+1}/{total_rows})...")
                 progress_bar.progress((index) / total_rows)
                 
+                # Check for skipped records early
                 if hour.get("skip_calc", False):
                     row_dict = {
                         "Date": hour["date_string_final"],
@@ -524,6 +533,7 @@ def run_browser_automation(hourly_data, data_source_label, standard_choice):
         st.session_state.fallback_active = True
         computed_results = []
         for index, hour in enumerate(hourly_data):
+            # Same safety check in the overall exception fallback branch
             if hour.get("skip_calc", False):
                 row_dict = {
                     "Date": hour["date_string_final"],
@@ -625,6 +635,7 @@ def generate_compliance_plot(results, worker_weight, is_forecast, use_caf, caf_l
     ax.plot(watts_range, limit_curve_f, color='crimson', linestyle='-', linewidth=2.5, label=limit_label)
     ax.plot(watts_range, alert_curve_f, color='darkorange', linestyle='--', linewidth=2.5, label=alert_label)
     
+    # Filter N/A results so the plot continues rendering successfully
     x_watts = [r["Adjusted_Watts"] for r in results if r["Sun_WBGT_F"] != "N/A"]
     y_sun = [r["Sun_WBGT_F"] for r in results if r["Sun_WBGT_F"] != "N/A"]
     y_shade = [r["Shade_WBGT_F"] for r in results if r["Shade_WBGT_F"] != "N/A"]
@@ -812,8 +823,8 @@ with st.expander("📖 How-To Guide: Running Heat Stress Assessments"):
 
     ---
     ### Step 2: Set Work Levels and Clothing
-    1. **Pick your safety standard**: Choose between **ACGIH** (Default / Primary) or **NIOSH** guidelines.
-    2. **Clothing Adjustment Factors**: Turn on the clothing adjustment option, check the [Clothing Adjustment Factors](https://www.osha.gov/heat-exposure/hazards#ClothingAdjustmentFactors) reference guide, and pick the matching outfit type.
+    1. **Pick your safety standard**: Choose between **NIOSH** (the standard default) or **ACGIH** guidelines.
+    2. **Clothing Adjustment Factors**: Turns on the clothing adjustment option, check the [Clothing Adjustment Factors](https://www.osha.gov/heat-exposure/hazards#ClothingAdjustmentFactors) reference guide, and pick the matching outfit type.
     3. **Choose how hard people are working**: 
        * **Standard mode**: Pick simple activity levels for each hour (like Light, Moderate, or Heavy) from the dropdowns.
        * **Advanced mode**: If you prefer, enter specific metabolic energy values or worker details like age and height for a more tailored estimate. This is advanced and should only be used when familiar with these workload estimates.
@@ -1008,16 +1019,13 @@ elif st.session_state.step == 2:
     st.markdown("### Heat Stress Standard")
     standard_choice = st.radio(
         "Select Evaluation Standard", 
-        ["ACGIH (Default / Primary)", "NIOSH"],
-        index=0 if "ACGIH" in st.session_state.get("standard_choice", "ACGIH") else 1,
-        help="ACGIH TLVs® and Action Limits are optimized for professional heat stress evaluation. NIOSH RELs/RALs are available as secondary reference."
+        ["NIOSH (Default)", "ACGIH (Requires Permission)"],
+        help="NIOSH values are public domain. ACGIH values are copyrighted intellectual property."
     )
     st.session_state.standard_choice = standard_choice
     
     if "ACGIH" in standard_choice:
-        st.info("ℹ️ **ACGIH® Evaluation Active:** Computations will evaluate exposure against ACGIH® Threshold Limit Values (TLV®) and Action Limits (AL).")
-    else:
-        st.info("ℹ️ **NIOSH Evaluation Active:** Computations will evaluate exposure against NIOSH Recommended Exposure Limits (REL) and Recommended Alert Limits (RAL).")
+        st.warning("**LEGAL DISCLAIMER:** TLVs® and BEIs® are copyrighted property of the American Conference of Governmental Industrial Hygienists (ACGIH®). This application is not endorsed by, sponsored by, or affiliated with ACGIH. This toggle is included for internal testing and pending formal permission.")
     
     st.markdown("### Clothing & PPE Adjustment Factor (Optional)")
     use_caf = st.toggle("Apply Clothing Adjustment Factor (CAF)", value=st.session_state.use_caf)
@@ -1122,16 +1130,11 @@ elif st.session_state.step == 2:
                     stn_name = st.session_state.location_meta.get("station_name", "Unknown Station")
                     data_source_label = f"NOAA LCD Station Data ({stn_name})"
                 else:
-                    if st.session_state.is_forecast:
-                        data_source_label = "Open-Meteo Forecast (NOAA HRRR / GFS Models)"
-                    else:
-                        target_dt_str = st.session_state.final_hourly_rows[0]["date_string_final"]
-                        target_dt = datetime.strptime(target_dt_str, "%m/%d/%Y").date()
-                        if (date.today() - target_dt).days < 6:
-                            data_source_label = "Open-Meteo Archive (Preliminary ERA5T / Recent Model Blend)"
-                        else:
-                            data_source_label = "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
-                            
+                    data_source_label = (
+                        "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
+                        if st.session_state.is_forecast 
+                        else "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
+                    )
                 results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
                 
             if results:
