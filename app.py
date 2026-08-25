@@ -1122,11 +1122,16 @@ elif st.session_state.step == 2:
                     stn_name = st.session_state.location_meta.get("station_name", "Unknown Station")
                     data_source_label = f"NOAA LCD Station Data ({stn_name})"
                 else:
-                    data_source_label = (
-                        "Open-Meteo Forecast (NOAA HRRR / GFS Models)" 
-                        if st.session_state.is_forecast 
-                        else "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
-                    )
+                    if st.session_state.is_forecast:
+                        data_source_label = "Open-Meteo Forecast (NOAA HRRR / GFS Models)"
+                    else:
+                        target_dt_str = st.session_state.final_hourly_rows[0]["date_string_final"]
+                        target_dt = datetime.strptime(target_dt_str, "%m/%d/%Y").date()
+                        if (date.today() - target_dt).days < 6:
+                            data_source_label = "Open-Meteo Archive (Preliminary ERA5T / Recent Model Blend)"
+                        else:
+                            data_source_label = "Open-Meteo Archive (ERA5 / NOAA Station Reanalysis)"
+                            
                 results = run_browser_automation(st.session_state.final_hourly_rows, data_source_label, st.session_state.standard_choice)
                 
             if results:
