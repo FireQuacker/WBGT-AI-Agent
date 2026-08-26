@@ -835,7 +835,7 @@ with st.expander("📚 Methodology, Data Sources & About the Author"):
     ### 🌤️ Weather Data & Meteorological Modeling
     After establishing coordinates, the application uses one of two methods for weather data:
     1.  **Open-Meteo API:** For both historical and future forecast data, the app interfaces with the Open-Meteo API. 
-        - **Historical Mode:** Uses the ERA5 global reanalysis dataset.
+        - **Historical Mode:** Uses the ERA5 global reanalysis dataset. If incident date is within 5-days of the current date, ERA5T Preliminary will may be used.
         - **Forecast Mode:** Uses a blend of leading forecast models like NOAA's GFS and HRRR.
     2.  **NOAA Local CSV Upload:** Users can upload a CSV file from the NOAA NCEI database. The application intelligently parses this data, using the station's coordinates to determine the local time zone and automatically handle Daylight Saving Time (DST) for the given date.
 
