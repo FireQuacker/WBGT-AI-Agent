@@ -30,7 +30,7 @@ install_browser_engine()
 # =====================================================================
 # STREAMLIT CONFIGURATION & PERSISTENCE STATE
 # =====================================================================
-st.set_page_config(page_title="Andre's OSHA-WBGT Localized Calculator", layout="wide")
+st.set_page_config(page_title="Andre's WBGT Calculator", layout="wide")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -834,10 +834,10 @@ st.session_state.is_forecast = st.toggle(
 )
 
 if st.session_state.is_forecast:
-    st.title("🌤️ OSHA-WBGT Predictive Forecast Calculator")
+    st.title("🌤️ Taylor WBGT Heat Stress Engine - Predictive Forecast")
     st.warning("⚠️ **FORECAST WARNING:** This tool uses forecast models for future planning. On-site environmental tracking remains mandatory.")
 else:
-    st.title("☀️ André's OSHA-WBGT Localized Calculator")
+    st.title("☀️ Taylor WBGT Heat Stress Engine")
 
 st.markdown("**Occupational Heat Exposure Analytics by Andre Taylor**")
 st.divider()
